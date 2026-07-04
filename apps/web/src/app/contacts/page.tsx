@@ -423,12 +423,16 @@ function ScheduleModal({ contactIds, onClose, onDone }: { contactIds: string[]; 
 }
 
 /* ── phone normaliser ───────────────────────────────────────── */
+// Salvage a sendable E.164 number from messy input: strips every non-digit (spaces,
+// dashes, dots, slashes, parens), drops a leading "00" international prefix, and requires
+// a non-zero first digit + 7–15 digits (matches the backend's isValidE164). Excel cells
+// stored as numbers stringify cleanly here too. Returns '' when nothing valid can be built.
 function toE164(raw: unknown): string {
-  const original = String(raw ?? '').trim().replace(/\r/g, '');
-  const stripped = original.replace(/[\s\-().]/g, '');
-  const digits = stripped.startsWith('+') ? stripped.slice(1) : stripped;
-  if (!/^\d{7,15}$/.test(digits)) return '';
-  return `+${digits}`;
+  let digits = String(raw ?? '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (!digits) return '';
+  const e164 = `+${digits}`;
+  return /^\+[1-9]\d{6,14}$/.test(e164) ? e164 : '';
 }
 
 /* ── Import modal ───────────────────────────────────────────── */
@@ -457,13 +461,18 @@ function parseCSVLine(line: string): string[] {
   return fields;
 }
 
-function parseCSV(text: string): ParsedContact[] {
+// Returns the valid contacts plus the total data-row count so callers can report how
+// many rows were skipped for a blank/invalid phone (rather than dropping them silently).
+interface ParseResult { valid: ParsedContact[]; total: number }
+
+function parseCSV(text: string): ParseResult {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
-  if (lines.length < 2) return [];
+  if (lines.length < 2) return { valid: [], total: 0 };
   // normalise header: lowercase, strip spaces/underscores so "Lead Temp" == "leadtemp"
   const header = parseCSVLine(lines[0] ?? '').map((h) => h.toLowerCase().replace(/[\s_]/g, ''));
   const idx = (col: string) => header.indexOf(col);
-  return lines.slice(1).map((line) => {
+  const dataRows = lines.slice(1);
+  const valid = dataRows.map((line) => {
     const cols = parseCSVLine(line);
     const phone = toE164(idx('phone') >= 0 ? cols[idx('phone')] : cols[0]);
     const name = (idx('name') >= 0 ? cols[idx('name')] : cols[1]) || undefined;
@@ -474,13 +483,14 @@ function parseCSV(text: string): ParsedContact[] {
     const leadTemp: LeadTemp | undefined = (['HOT','WARM','COLD'] as string[]).includes(rawT ?? '') ? rawT as LeadTemp : undefined;
     return { phone, name, city, interest, notes, leadTemp };
   }).filter((c) => c.phone.length > 0);
+  return { valid, total: dataRows.length };
 }
 
-function parseExcel(buffer: ArrayBuffer): ParsedContact[] {
+function parseExcel(buffer: ArrayBuffer): ParseResult {
   const wb = XLSX.read(buffer, { type: 'array' });
   const ws = wb.Sheets[wb.SheetNames[0]!]!;
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '' });
-  return rows.map((row) => {
+  const valid = rows.map((row) => {
     const get = (...keys: string[]) => {
       for (const k of keys) {
         const found = Object.entries(row).find(([rk]) => rk.toLowerCase().includes(k.toLowerCase()));
@@ -505,11 +515,13 @@ function parseExcel(buffer: ArrayBuffer): ParsedContact[] {
       notes: noteParts.length ? noteParts.join(' | ') : undefined,
     };
   }).filter((c) => c.phone.length > 0);
+  return { valid, total: rows.length };
 }
 
 function ImportModal({ onClose, onDone, smartListId, listName }: { onClose: () => void; onDone: () => void; smartListId?: string; listName?: string }) {
   const [csvText, setCsvText] = useState('');
   const [parsed, setParsed] = useState<ParsedContact[] | null>(null);
+  const [parseSkipped, setParseSkipped] = useState(0);
   const [fileName, setFileName] = useState('');
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState('');
@@ -526,21 +538,26 @@ function ImportModal({ onClose, onDone, smartListId, listName }: { onClose: () =
       reader.onload = (ev) => {
         const data = ev.target?.result as ArrayBuffer;
         try {
-          const contacts = parseExcel(data);
-          setParsed(contacts);
+          const { valid, total } = parseExcel(data);
+          setParsed(valid);
+          setParseSkipped(total - valid.length);
           setCsvText('');
-          toast(`${contacts.length} rows parsed from Excel`, 'success');
+          const dropped = total - valid.length;
+          toast(
+            `${valid.length} valid contacts parsed${dropped > 0 ? ` — ${dropped} skipped (blank/invalid phone)` : ''}`,
+            dropped > 0 ? 'warning' : 'success',
+          );
         } catch { toast('Failed to parse Excel file', 'error'); }
       };
       reader.readAsArrayBuffer(file);
     } else {
       const reader = new FileReader();
-      reader.onload = (ev) => { setCsvText((ev.target?.result as string) ?? ''); setParsed(null); };
+      reader.onload = (ev) => { setCsvText((ev.target?.result as string) ?? ''); setParsed(null); setParseSkipped(0); };
       reader.readAsText(file);
     }
   };
 
-  const getContacts = (): ParsedContact[] => parsed ?? parseCSV(csvText);
+  const getContacts = (): ParsedContact[] => parsed ?? parseCSV(csvText).valid;
 
   const handleImport = async () => {
     setLoading(true);
@@ -549,21 +566,26 @@ function ImportModal({ onClose, onDone, smartListId, listName }: { onClose: () =
       if (!contacts.length) { toast('No valid rows found', 'error'); return; }
       const CHUNK = 500;
       let totalImported = 0;
-      let totalSkipped = 0;
+      let totalDuplicates = 0;
+      let totalSkipped = parseSkipped; // rows already dropped at parse for a bad phone
       const total = contacts.length;
       for (let i = 0; i < contacts.length; i += CHUNK) {
         const slice = contacts.slice(i, i + CHUNK);
         const done = Math.min(i + CHUNK, total);
         setProgress(`Importing ${done} / ${total}…`);
-        const r = await apiFetch<{ imported: number; skipped: number }>('/contacts/import', {
+        const r = await apiFetch<{ imported: number; skipped: number; duplicates: number }>('/contacts/import', {
           method: 'POST',
           body: JSON.stringify({ contacts: slice, ...(smartListId ? { smartListId } : {}) }),
         });
         totalImported += r.imported;
+        totalDuplicates += r.duplicates ?? 0;
         totalSkipped += r.skipped;
       }
       setProgress('');
-      toast(`Imported ${totalImported}${totalSkipped ? `, skipped ${totalSkipped} invalid` : ''}`, 'success');
+      const parts = [`Imported ${totalImported} new`];
+      if (totalDuplicates) parts.push(`${totalDuplicates} already existed`);
+      if (totalSkipped) parts.push(`${totalSkipped} skipped (invalid phone)`);
+      toast(parts.join(' · '), 'success');
       onDone();
       onClose();
     } catch (err) { toast(String(err), 'error'); setProgress(''); }

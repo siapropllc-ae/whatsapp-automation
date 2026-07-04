@@ -8,8 +8,27 @@ import type { ImportContactsDto } from './dto/import-contacts.dto';
 import type { ContactItemDto } from './dto/contact-item.dto';
 
 export interface ImportResult {
-  imported: number;
-  skipped: number;
+  imported: number;   // new contacts created
+  skipped: number;    // rows with a blank/invalid phone number
+  duplicates: number; // rows whose phone already existed (in the file or the DB)
+}
+
+// Postgres caps a statement at 65535 bind params; contacts have ~8 columns, so keep
+// each createMany batch well under that. Also keeps memory/pooler pressure low for 10k+ files.
+const IMPORT_BATCH_SIZE = 1000;
+
+/**
+ * Recovers a sendable E.164 number from messy input (Excel numeric cells, spaces, dashes,
+ * dots, slashes, a leading "00" international prefix). Returns null when nothing valid
+ * can be salvaged (e.g. blank, too short/long, or a local number with no country code).
+ */
+function normalizePhone(raw: unknown): string | null {
+  const s = String(raw ?? '').trim();
+  let digits = s.replace(/\D/g, ''); // drop every non-digit (keeps only 0-9)
+  if (digits.startsWith('00')) digits = digits.slice(2); // 00 = international dialing prefix
+  if (!digits) return null;
+  const e164 = `+${digits}`;
+  return isValidE164(e164) ? e164 : null;
 }
 
 export interface ValidateResult {
@@ -78,50 +97,64 @@ export class ContactsService {
   }
 
   async importContacts(dto: ImportContactsDto): Promise<ImportResult> {
-    const results = await Promise.allSettled(
-      dto.contacts.map((item) => {
-        const vars =
-          item.vars !== undefined
-            ? (item.vars as Prisma.InputJsonValue)
-            : undefined;
-        return this.prisma.contact.upsert({
-          where: { phone: item.phone },
-          update: {
-            name: item.name,
-            city: item.city,
-            interest: item.interest,
-            notes: item.notes,
-            leadTemp: item.leadTemp ?? LeadTemp.COLD,
-            vars,
-            tags: item.tags ?? [],
-          },
-          create: {
-            phone: item.phone,
-            name: item.name,
-            city: item.city,
-            interest: item.interest,
-            notes: item.notes,
-            leadTemp: item.leadTemp ?? LeadTemp.COLD,
-            vars,
-            tags: item.tags ?? [],
-          },
-        });
-      }),
-    );
-
-    const fulfilled = results.filter(
-      (r): r is PromiseFulfilledResult<Contact> => r.status === 'fulfilled',
-    );
-    const skipped = results.filter((r) => r.status === 'rejected').length;
-
-    if (dto.smartListId && fulfilled.length > 0) {
-      await this.prisma.smartListContact.createMany({
-        data: fulfilled.map((r) => ({ smartListId: dto.smartListId!, contactId: r.value.id })),
-        skipDuplicates: true,
+    // 1) Normalize + validate each row; drop (don't reject) the ones we can't salvage.
+    //    Dedupe by phone within the file, keeping the first occurrence.
+    let invalid = 0;
+    let validCount = 0; // valid rows BEFORE in-file dedupe (used to count duplicates)
+    const byPhone = new Map<string, Prisma.ContactCreateManyInput>();
+    for (const item of dto.contacts) {
+      const phone = normalizePhone(item.phone);
+      if (!phone) {
+        invalid++;
+        continue;
+      }
+      validCount++;
+      if (byPhone.has(phone)) continue; // in-file duplicate
+      byPhone.set(phone, {
+        phone,
+        name: item.name,
+        city: item.city,
+        interest: item.interest,
+        notes: item.notes,
+        leadTemp: item.leadTemp ?? LeadTemp.COLD,
+        vars: item.vars !== undefined ? (item.vars as Prisma.InputJsonValue) : undefined,
+        tags: item.tags ?? [],
       });
     }
 
-    return { imported: fulfilled.length, skipped };
+    const rows = [...byPhone.values()];
+    const uniquePhones = [...byPhone.keys()];
+
+    // 2) Bulk insert in batches. createMany + skipDuplicates is one statement per batch —
+    //    it can't exhaust the connection pool the way hundreds of concurrent upserts could,
+    //    and existing phones are simply skipped (the unique phone constraint dedupes vs the DB).
+    let created = 0;
+    for (let i = 0; i < rows.length; i += IMPORT_BATCH_SIZE) {
+      const batch = rows.slice(i, i + IMPORT_BATCH_SIZE);
+      const res = await this.prisma.contact.createMany({ data: batch, skipDuplicates: true });
+      created += res.count;
+    }
+
+    // 3) Optionally add every valid contact (new OR pre-existing) to the target smart list.
+    if (dto.smartListId && uniquePhones.length > 0) {
+      for (let i = 0; i < uniquePhones.length; i += IMPORT_BATCH_SIZE) {
+        const phoneBatch = uniquePhones.slice(i, i + IMPORT_BATCH_SIZE);
+        const contacts = await this.prisma.contact.findMany({
+          where: { phone: { in: phoneBatch } },
+          select: { id: true },
+        });
+        if (contacts.length > 0) {
+          await this.prisma.smartListContact.createMany({
+            data: contacts.map((c) => ({ smartListId: dto.smartListId!, contactId: c.id })),
+            skipDuplicates: true,
+          });
+        }
+      }
+    }
+
+    // duplicates = valid rows that did not become a NEW contact (in-file dupes + already in DB)
+    const duplicates = validCount - created;
+    return { imported: created, skipped: invalid, duplicates };
   }
 
   async listContacts(params?: {
