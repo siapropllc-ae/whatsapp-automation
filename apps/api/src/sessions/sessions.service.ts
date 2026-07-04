@@ -7,7 +7,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { type Prisma, type Session, MediaType, MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
+import { type Prisma, type Session, CampaignStatus, MediaType, MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -511,18 +511,44 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       const statusCode = err?.output?.statusCode;
       this.log.warn(`[${sessionId}] connection closed — statusCode=${statusCode ?? 'none'} err=${String(lastDisconnect?.error ?? 'none')}`);
 
+      if (statusCode === DisconnectReason.forbidden) {
+        // 403 forbidden is WhatsApp's explicit ban signal. Mark BANNED, stop reconnecting
+        // (hammering a banned number worsens its standing), and pause any campaigns using it.
+        this.log.error(
+          `[${sessionId}] connection forbidden (403) — treating as BAN. Marking BANNED and pausing its campaigns.`,
+        );
+        await this.setStatus(sessionId, SessionStatus.BANNED);
+        await this.proxy.releaseProxy(sessionId);
+        this.sockets.delete(sessionId);
+        this.reconnectDelays.delete(sessionId);
+        await this.pauseCampaignsForSession(sessionId);
+        return;
+      }
+
       if (statusCode === DisconnectReason.loggedOut) {
         // loggedOut fires for both manual phone-side logout AND WhatsApp bans.
-        // The two are indistinguishable from the disconnect code alone.
-        // Mark OFFLINE so the operator can inspect; re-connecting reveals if actually banned
-        // (WA will reject the QR with a ban error only if the number is genuinely banned).
+        // The two are indistinguishable from the disconnect code alone. Either way the
+        // session can no longer send, so mark OFFLINE and pause its campaigns so queued
+        // work doesn't grind out failures; the operator re-links (or investigates a ban).
         this.log.warn(
-          `[${sessionId}] loggedOut — could be manual logout or a ban. Marking OFFLINE. ` +
+          `[${sessionId}] loggedOut — could be manual logout or a ban. Marking OFFLINE and pausing its campaigns. ` +
           `Re-connect to verify; WA rejects the QR with a ban notice if the number is banned.`,
         );
         await this.setStatus(sessionId, SessionStatus.OFFLINE);
         await this.proxy.releaseProxy(sessionId);
         this.sockets.delete(sessionId);
+        this.reconnectDelays.delete(sessionId);
+        await this.pauseCampaignsForSession(sessionId);
+        return;
+      }
+
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        // 440 means the session was opened on another device — reconnecting here just
+        // fights that device in a replace loop. Go OFFLINE and stop; operator must re-link.
+        this.log.warn(`[${sessionId}] connection replaced (440) — another device took over. Marking OFFLINE, not reconnecting.`);
+        await this.setStatus(sessionId, SessionStatus.OFFLINE);
+        this.sockets.delete(sessionId);
+        this.reconnectDelays.delete(sessionId);
         return;
       }
 
@@ -577,6 +603,51 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     } catch {
       // Session may have been deleted; skip silently
     }
+  }
+
+  /**
+   * Pauses every RUNNING campaign that still has queued messages assigned to this session.
+   * Called when a session is banned/logged-out/circuit-broken so queued work stops instead
+   * of grinding out failures against a dead session. Returns the number of campaigns paused.
+   */
+  async pauseCampaignsForSession(sessionId: string): Promise<number> {
+    try {
+      const rows = await this.prisma.campaignMessage.findMany({
+        where: {
+          sessionId,
+          status: MsgStatus.QUEUED,
+          campaign: { status: CampaignStatus.RUNNING },
+        },
+        select: { campaignId: true },
+        distinct: ['campaignId'],
+      });
+      const ids = rows.map((r) => r.campaignId);
+      if (!ids.length) return 0;
+      const res = await this.prisma.campaign.updateMany({
+        where: { id: { in: ids }, status: CampaignStatus.RUNNING },
+        data: { status: CampaignStatus.PAUSED },
+      });
+      if (res.count > 0) {
+        this.log.warn(`Paused ${res.count} campaign(s) that were sending through session ${sessionId}`);
+      }
+      return res.count;
+    } catch (err) {
+      this.log.error(`pauseCampaignsForSession failed [${sessionId}]: ${String(err)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Circuit breaker: called by the send workers after too many consecutive send failures
+   * on a session. Pauses the session's campaigns so a broken/banned session stops bleeding
+   * failures. Session status is left to the connection lifecycle to avoid contradicting a
+   * still-open socket; the loud log + paused campaign is the safety action.
+   */
+  async tripCircuitBreaker(sessionId: string, failureCount: number): Promise<void> {
+    this.log.error(
+      `[${sessionId}] circuit breaker tripped after ${failureCount} consecutive send failures — pausing its campaigns`,
+    );
+    await this.pauseCampaignsForSession(sessionId);
   }
 
   /**

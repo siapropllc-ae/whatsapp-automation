@@ -112,4 +112,87 @@ describe('DelayService', () => {
       });
     });
   });
+
+  // ── computeTypingMs ─────────────────────────────────────────────────────────
+
+  describe('computeTypingMs', () => {
+    it('always returns an integer within [1000, 15000]', () => {
+      for (const len of [0, 1, 10, 50, 200, 1000, 5000]) {
+        for (let i = 0; i < 50; i++) {
+          const t = service.computeTypingMs(len);
+          expect(Number.isInteger(t)).toBe(true);
+          expect(t).toBeGreaterThanOrEqual(1000);
+          expect(t).toBeLessThanOrEqual(15000);
+        }
+      }
+    });
+
+    it('caps very long messages at 15000ms', () => {
+      expect(service.computeTypingMs(10_000)).toBe(15000);
+    });
+
+    it('scales up with message length on average', () => {
+      const avg = (len: number) =>
+        Array.from({ length: 200 }, () => service.computeTypingMs(len)).reduce((a, b) => a + b, 0) / 200;
+      expect(avg(200)).toBeGreaterThan(avg(10));
+    });
+  });
+
+  // ── hourlyCap ───────────────────────────────────────────────────────────────
+
+  describe('hourlyCap', () => {
+    it('is ceil(dailyCap × 0.2) with a floor of 1', () => {
+      expect(service.hourlyCap(1000)).toBe(200);
+      expect(service.hourlyCap(60)).toBe(12);
+      expect(service.hourlyCap(1)).toBe(1); // max(1, ceil(0.2))
+    });
+  });
+
+  // ── requeueJitterMs ─────────────────────────────────────────────────────────
+
+  describe('requeueJitterMs', () => {
+    it('stays within [0, meanMs)', () => {
+      for (let i = 0; i < 500; i++) {
+        const j = service.requeueJitterMs();
+        expect(j).toBeGreaterThanOrEqual(0);
+        expect(j).toBeLessThan(service.meanMs);
+      }
+    });
+  });
+
+  // ── burst-break helpers ─────────────────────────────────────────────────────
+
+  describe('computeBurstThreshold', () => {
+    it('stays within [burstBreakMinSends, burstBreakMaxSends]', () => {
+      for (let i = 0; i < 500; i++) {
+        const n = service.computeBurstThreshold();
+        expect(n).toBeGreaterThanOrEqual(service.burstBreakMinSends);
+        expect(n).toBeLessThanOrEqual(service.burstBreakMaxSends);
+      }
+    });
+  });
+
+  describe('computeBurstBreakMs', () => {
+    it('is between 15 and 45 minutes', () => {
+      for (let i = 0; i < 200; i++) {
+        const ms = service.computeBurstBreakMs();
+        expect(ms).toBeGreaterThanOrEqual(15 * 60_000);
+        expect(ms).toBeLessThanOrEqual(45 * 60_000);
+      }
+    });
+  });
+
+  // ── hourly bucket helpers ────────────────────────────────────────────────────
+
+  describe('utcHourStamp / msUntilNextHour', () => {
+    it('formats the UTC hour bucket as YYYYMMDDHH', () => {
+      expect(service.utcHourStamp(new Date('2026-07-05T13:42:10Z'))).toBe('2026070513');
+    });
+
+    it('returns ms remaining to the next UTC hour (min 30s)', () => {
+      expect(service.msUntilNextHour(new Date('2026-07-05T13:30:00Z'))).toBe(1_800_000);
+      // Within the last 30s of the hour it clamps to the 30s floor
+      expect(service.msUntilNextHour(new Date('2026-07-05T13:59:50Z'))).toBe(30_000);
+    });
+  });
 });

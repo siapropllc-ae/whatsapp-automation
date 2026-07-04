@@ -10,17 +10,42 @@ export interface SessionWarmupData {
   dailySent: number;
 }
 
+/** Warmup schedule graduates on this day — after it, the env DAILY_SEND_LIMIT applies. */
+const GRADUATION_DAY = 40;
+
 /**
- * Day-range → cap mapping.
- * Day 15+ falls through to the env DAILY_SEND_LIMIT.
+ * Total daily-send cap by warmup day-range. Ramps gently to the env DAILY_SEND_LIMIT
+ * (target 1000/day) over ~40 days. Day GRADUATION_DAY+ falls through to DAILY_SEND_LIMIT.
  */
 const WARMUP_CAPS: [minDay: number, maxDay: number, cap: number][] = [
-  [0,  2,  10],   // Days 0–2:  10/day  — critical to avoid ban on new number
-  [3,  5,  25],   // Days 3–5:  25/day
-  [6,  9,  50],   // Days 6–9:  50/day
-  [10, 13, 100],  // Days 10–13: 100/day
-  [14, 20, 150],  // Days 14–20: 150/day
-  // Day 21+ falls through to DAILY_SEND_LIMIT env (default 200)
+  [0,  2,  15],
+  [3,  6,  35],
+  [7,  10, 60],
+  [11, 14, 100],
+  [15, 19, 160],
+  [20, 24, 250],
+  [25, 29, 400],
+  [30, 34, 600],
+  [35, 39, 800],
+  // Day 40+ falls through to DAILY_SEND_LIMIT env (default 1000)
+];
+
+/**
+ * Cold first-contact ("stranger") daily sub-cap by warmup day-range. This is the real
+ * ban protection: WhatsApp throttles new-conversation spam hardest. Always <= total cap.
+ * Day GRADUATION_DAY+ falls through to DAILY_SEND_LIMIT (cold cap catches up to total).
+ */
+const STRANGER_CAPS: [minDay: number, maxDay: number, cap: number][] = [
+  [0,  2,  8],
+  [3,  6,  20],
+  [7,  10, 35],
+  [11, 14, 60],
+  [15, 19, 100],
+  [20, 24, 170],
+  [25, 29, 300],
+  [30, 34, 480],
+  [35, 39, 700],
+  // Day 40+ falls through to DAILY_SEND_LIMIT env (default 1000)
 ];
 
 @Injectable()
@@ -32,41 +57,55 @@ export class WarmupService {
     private readonly prisma: PrismaService,
     config: ConfigService,
   ) {
-    this.dailyLimit = +(config.get<string>('DAILY_SEND_LIMIT') ?? '200');
+    this.dailyLimit = +(config.get<string>('DAILY_SEND_LIMIT') ?? '1000');
   }
 
   /**
-   * Returns the effective daily send cap for a session.
-   * Uses warmup schedule when warmupDay < 15; falls back to env limit.
+   * Returns the effective total daily send cap for a session.
+   * Uses warmup schedule until GRADUATION_DAY; then falls back to env limit.
    */
   getEffectiveDailyLimit(session: SessionWarmupData): number {
-    const { warmupDay } = session;
-    if (warmupDay >= 21) return this.dailyLimit;
-    for (const [min, max, cap] of WARMUP_CAPS) {
+    return this.capFrom(WARMUP_CAPS, session.warmupDay);
+  }
+
+  /**
+   * Returns the effective cold first-contact ("stranger") daily sub-cap for a session.
+   * Never exceeds the total daily cap.
+   */
+  getEffectiveStrangerLimit(session: SessionWarmupData): number {
+    return Math.min(
+      this.capFrom(STRANGER_CAPS, session.warmupDay),
+      this.getEffectiveDailyLimit(session),
+    );
+  }
+
+  private capFrom(table: [number, number, number][], warmupDay: number): number {
+    if (warmupDay >= GRADUATION_DAY) return this.dailyLimit;
+    for (const [min, max, cap] of table) {
       if (warmupDay >= min && warmupDay <= max) return cap;
     }
     return this.dailyLimit;
   }
 
   /**
-   * Midnight cron: atomic midnight reset.
-   * ONLINE sessions: increment warmupDay AND reset dailySent in one query.
-   * All other sessions: reset dailySent only (warmupDay stays until they reconnect).
-   * Single cron avoids the race condition of two separate midnight jobs operating
-   * on overlapping session sets.
+   * Midnight cron: advance warmup + reset daily counters.
+   * warmupDay only advances for ONLINE sessions that actually SENT something that day —
+   * an idle-but-connected number must not "graduate" to higher caps without real
+   * sending reputation. Counters (dailySent, strangerSent) reset for every session.
+   * Two updateMany calls (increment-then-blanket-reset) avoid overlap races.
    */
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async midnightReset(): Promise<void> {
-    const online = await this.prisma.session.updateMany({
-      where: { status: SessionStatus.ONLINE },
-      data: { warmupDay: { increment: 1 }, dailySent: 0 },
+    const advanced = await this.prisma.session.updateMany({
+      where: { status: SessionStatus.ONLINE, dailySent: { gt: 0 } },
+      data: { warmupDay: { increment: 1 } },
     });
-    const others = await this.prisma.session.updateMany({
-      where: { status: { not: SessionStatus.ONLINE } },
-      data: { dailySent: 0 },
+    const reset = await this.prisma.session.updateMany({
+      where: {},
+      data: { dailySent: 0, strangerSent: 0 },
     });
     this.log.log(
-      `Warmup midnight: incremented warmupDay + reset dailySent for ${online.count} ONLINE session(s); reset dailySent for ${others.count} other session(s)`,
+      `Warmup midnight: advanced warmupDay for ${advanced.count} active session(s); reset counters for ${reset.count} session(s)`,
     );
   }
 }

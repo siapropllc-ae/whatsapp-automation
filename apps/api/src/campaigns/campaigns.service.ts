@@ -6,7 +6,7 @@ import {
   SessionStatus,
 } from '@prisma/client';
 
-import { spinText } from '@wa-engine/shared';
+import { spinText, countSpinVariants } from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
@@ -14,6 +14,9 @@ import { OutboxProducer } from '../queue/outbox.producer';
 import { SmartListsService } from '../smart-lists/smart-lists.service';
 import { type CreateCampaignDto } from './dto/create-campaign.dto';
 import { type LaunchCampaignDto } from './dto/launch-campaign.dto';
+
+/** Below this many spin variants, a large cold send looks templated — warn the operator. */
+const MIN_SPIN_VARIANTS = 5;
 
 function mapP2025(id: string, label: string): (e: unknown) => never {
   return (e: unknown) => {
@@ -222,6 +225,18 @@ export class CampaignsService {
         })
       ).map((m) => m.contactId),
     );
+
+    // Anti-ban spin-variation guard. A template with little spin variety sends nearly the
+    // same text to everyone — a strong spam signal. Personalization variables ({name}) also
+    // add real-world variety, so this is a warning (not a hard block) to avoid breaking
+    // legitimate personalized-but-unspun templates.
+    const spinVariants = countSpinVariants(template.body);
+    if (spinVariants < MIN_SPIN_VARIANTS && newContacts.length > spinVariants * 4) {
+      this.log.warn(
+        `Campaign ${id}: template "${template.name}" has only ~${spinVariants} spin variant(s) for ` +
+        `${newContacts.length} recipients — add {option A|option B} spin syntax to reduce ban risk.`,
+      );
+    }
 
     // Cumulative delay per session (ms from now)
     const sessionDelays = new Map<string, number>();

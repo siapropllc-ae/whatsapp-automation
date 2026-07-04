@@ -79,6 +79,8 @@ model Session {
   proxyId     String?
   warmupDay   Int           @default(0)
   dailySent   Int           @default(0)
+  strangerSent        Int   @default(0) // cold first-contact sends today (reset at midnight with dailySent)
+  consecutiveFailures Int   @default(0) // circuit breaker; reset to 0 on each successful send
   createdAt   DateTime      @default(now())
   messages    CampaignMessage[]
 }

@@ -30,7 +30,7 @@ describe('ProxyService', () => {
   let tx: TxMock;
 
   const mockPrisma = {
-    proxy: { findFirst: jest.fn(), update: jest.fn(), findMany: jest.fn() },
+    proxy: { findFirst: jest.fn(), update: jest.fn(), findMany: jest.fn(), count: jest.fn().mockResolvedValue(0) },
     session: { findUnique: jest.fn(), update: jest.fn(), findMany: jest.fn() },
     $transaction: jest.fn(),
   };

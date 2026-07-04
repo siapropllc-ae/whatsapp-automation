@@ -20,7 +20,7 @@ export class ProxyService {
     private readonly prisma: PrismaService,
     config: ConfigService,
   ) {
-    this.rotationHours = +(config.get<string>('PROXY_ROTATION_HOURS') ?? '48');
+    this.rotationHours = +(config.get<string>('PROXY_ROTATION_HOURS') ?? '24');
   }
 
   /**
@@ -48,7 +48,17 @@ export class ProxyService {
     });
 
     if (!proxy) {
-      this.log.warn(`No free proxy available for session ${sessionId} — connecting without proxy`);
+      // Distinguish "no proxies configured at all" (bare server IP — higher ban risk) from
+      // "pool exhausted" (all proxies busy) so the operator knows whether to add proxies.
+      const total = await this.prisma.proxy.count();
+      if (total === 0) {
+        this.log.warn(
+          `[${sessionId}] no proxies configured — connecting on the bare server IP (higher ban risk). ` +
+          `Add proxies in Settings → Proxies to rotate IPs across sessions.`,
+        );
+      } else {
+        this.log.warn(`[${sessionId}] proxy pool exhausted (${total} configured, all in use) — connecting without proxy`);
+      }
       return null;
     }
 

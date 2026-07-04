@@ -46,35 +46,50 @@ class CreateProxyDto {
   country?: string;
 }
 
+// Hard anti-ban bounds — these floors/ceilings keep the delay engine in a safe range even
+// when an operator edits settings. Cross-field ordering (floor < mean < ceiling) is enforced
+// in patchEngine() against the MERGED effective values, since a PATCH may set only some fields.
+const MIN_DELAY_FLOOR_MS = 30_000; // 30s hard minimum between messages
+const MAX_DELAY_MS = 1_800_000; // 30min ceiling on any single delay
+const MIN_STD_DEV_MS = 5_000; // keep some timing variance (even spacing is a bot signal)
+const MAX_TYPING_MS = 30_000;
+const MAX_DAILY_LIMIT = 1_000;
+
 class PatchEngineDto {
   @IsOptional()
   @IsInt()
-  @Min(1000)
+  @Min(MIN_DELAY_FLOOR_MS)
+  @Max(MAX_DELAY_MS)
   meanMs?: number;
 
   @IsOptional()
   @IsInt()
-  @Min(0)
+  @Min(MIN_STD_DEV_MS)
+  @Max(MAX_DELAY_MS)
   stdDevMs?: number;
 
   @IsOptional()
   @IsInt()
-  @Min(1000)
+  @Min(MIN_DELAY_FLOOR_MS)
+  @Max(MAX_DELAY_MS)
   floorMs?: number;
 
   @IsOptional()
   @IsInt()
-  @Min(1000)
+  @Min(MIN_DELAY_FLOOR_MS)
+  @Max(MAX_DELAY_MS)
   ceilingMs?: number;
 
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(MAX_TYPING_MS)
   typingMs?: number;
 
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(MAX_DAILY_LIMIT)
   dailyLimit?: number;
 
   @IsOptional()
@@ -132,6 +147,24 @@ export class SettingsController {
 
   @Patch('antiban')
   async patchEngine(@Body() dto: PatchEngineDto): Promise<EngineSettings> {
+    // Validate cross-field ordering against the MERGED effective values (a PATCH may set
+    // only some fields, so we can't judge floor<mean<ceiling from the DTO alone).
+    const current = this.settings.getEngineSettings();
+    const floorMs = dto.floorMs ?? current.floorMs;
+    const meanMs = dto.meanMs ?? current.meanMs;
+    const ceilingMs = dto.ceilingMs ?? current.ceilingMs;
+    const stdDevMs = dto.stdDevMs ?? current.stdDevMs;
+    if (!(floorMs < meanMs && meanMs < ceilingMs)) {
+      throw new BadRequestException(
+        `Delay bounds must satisfy floor < mean < ceiling (got floor=${floorMs}, mean=${meanMs}, ceiling=${ceilingMs}).`,
+      );
+    }
+    if (stdDevMs > meanMs) {
+      throw new BadRequestException(
+        `Delay standard deviation (${stdDevMs}) cannot exceed the mean (${meanMs}).`,
+      );
+    }
+
     const pairs: [string, string][] = [];
     if (dto.meanMs !== undefined) pairs.push(['DELAY_MEAN_MS', String(dto.meanMs)]);
     if (dto.stdDevMs !== undefined) pairs.push(['DELAY_STD_DEV_MS', String(dto.stdDevMs)]);
@@ -147,16 +180,23 @@ export class SettingsController {
   /* ── Warmup schedule (read-only — hardcoded by design) ──────── */
   @Get('warmup')
   getWarmup() {
+    const graduatedCap = this.settings.getEngineSettings().dailyLimit;
     return {
       schedule: [
-        { fromDay: 0, toDay: 2, dailyCap: 10 },
-        { fromDay: 3, toDay: 5, dailyCap: 25 },
-        { fromDay: 6, toDay: 9, dailyCap: 50 },
-        { fromDay: 10, toDay: 13, dailyCap: 100 },
-        { fromDay: 14, toDay: 20, dailyCap: 150 },
-        { fromDay: 21, toDay: null, dailyCap: this.settings.getEngineSettings().dailyLimit },
+        { fromDay: 0, toDay: 2, dailyCap: 15, strangerCap: 8 },
+        { fromDay: 3, toDay: 6, dailyCap: 35, strangerCap: 20 },
+        { fromDay: 7, toDay: 10, dailyCap: 60, strangerCap: 35 },
+        { fromDay: 11, toDay: 14, dailyCap: 100, strangerCap: 60 },
+        { fromDay: 15, toDay: 19, dailyCap: 160, strangerCap: 100 },
+        { fromDay: 20, toDay: 24, dailyCap: 250, strangerCap: 170 },
+        { fromDay: 25, toDay: 29, dailyCap: 400, strangerCap: 300 },
+        { fromDay: 30, toDay: 34, dailyCap: 600, strangerCap: 480 },
+        { fromDay: 35, toDay: 39, dailyCap: 800, strangerCap: 700 },
+        { fromDay: 40, toDay: null, dailyCap: graduatedCap, strangerCap: graduatedCap },
       ],
-      note: 'Warmup schedule is fixed for optimal anti-ban protection. Day 21+ uses DAILY_SEND_LIMIT.',
+      note:
+        'Warmup schedule is fixed for optimal anti-ban protection. "Cold" is the stricter sub-cap ' +
+        'for first-contact messages to people who have never received one. Day 40+ uses DAILY_SEND_LIMIT.',
     };
   }
 

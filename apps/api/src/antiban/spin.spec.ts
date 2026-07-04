@@ -1,4 +1,4 @@
-import { spinText, isValidE164 } from '@wa-engine/shared';
+import { spinText, isValidE164, countSpinVariants } from '@wa-engine/shared';
 
 describe('spinText', () => {
   // ── basic spin ────────────────────────────────────────────────────────────
@@ -25,10 +25,10 @@ describe('spinText', () => {
       expect(result).toBe('Alice');
     });
 
-    it('leaves non-pipe {} unchanged when var is missing', () => {
+    it('drops a missing variable and trims the trailing space', () => {
       const result = spinText('Hello {unknown}');
-      // unknown var → empty string (the key isn't in vars)
-      expect(result).toBe('Hello ');
+      // unknown var → empty string; the trailing space is then collapsed/trimmed
+      expect(result).toBe('Hello');
     });
   });
 
@@ -109,6 +109,24 @@ describe('spinText', () => {
       const result = spinText('{a|b}{c|d}');
       expect(['ac', 'ad', 'bc', 'bd']).toContain(result);
     });
+  });
+});
+
+// ── countSpinVariants ─────────────────────────────────────────────────────────
+
+describe('countSpinVariants', () => {
+  it.each<[string, number]>([
+    ['plain text with no spin', 1],
+    ['{Hello|Hi|Hey}', 3],
+    ['{a|b}{c|d}', 4],
+    ['{Hello {there|friend}|Hi}', 3], // "Hello there", "Hello friend", "Hi"
+    ['{{a|b}|{c|d}}', 4],
+    ['{name}', 1], // single-option group = variable placeholder, not variance
+    ['Hi {name}, {50% off|half price} this {week|month}', 4], // 1 × 2 × 2
+    ['', 1],
+    ['{a|}', 2], // empty option still counts
+  ])('counts %s → %i variants', (template, expected) => {
+    expect(countSpinVariants(template)).toBe(expected);
   });
 });
 

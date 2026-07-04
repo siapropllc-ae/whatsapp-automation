@@ -182,7 +182,7 @@ export class FingerprintService {
       this.log.debug(`[${sessionId}] fingerprint reused → ${existing.deviceModel} (${existing.osVersion})`);
       return existing;
     }
-    const fp = FINGERPRINT_POOL[Math.floor(Math.random() * FINGERPRINT_POOL.length)]!;
+    const fp = this.pickProfile();
     await this.prisma.session.update({
       where: { id: sessionId },
       data: { fingerprint: fp as unknown as Prisma.InputJsonValue },
@@ -204,23 +204,34 @@ export class FingerprintService {
     return row.fingerprint as unknown as DeviceFingerprint;
   }
 
+  /** Picks a random profile from the pool, excluding the given device model when possible. */
+  private pickProfile(excludeModel?: string): DeviceFingerprint {
+    const candidates = excludeModel
+      ? FINGERPRINT_POOL.filter((p) => p.deviceModel !== excludeModel)
+      : FINGERPRINT_POOL;
+    const pool = candidates.length ? candidates : FINGERPRINT_POOL;
+    return pool[Math.floor(Math.random() * pool.length)]!;
+  }
+
   /**
-   * Weekly Sunday 03:00 rotation: force-assign a NEW random fingerprint for all
-   * non-OFFLINE sessions. Must write directly to Prisma rather than calling
-   * assignFingerprint(), which returns the existing fingerprint unchanged when
-   * one is already stored (correct for reconnects, wrong for rotation).
+   * Weekly Sunday 03:00 rotation: force-assign a new random fingerprint. Must write directly
+   * to Prisma rather than calling assignFingerprint(), which returns the existing fingerprint
+   * unchanged when one is already stored (correct for reconnects, wrong for rotation).
    */
   @Cron('0 3 * * 0')
   async rotateFingerprints(): Promise<void> {
-    // Rotate only OFFLINE sessions — changing a fingerprint on an ONLINE session
-    // causes a device-identity mismatch the moment it reconnects and is a ban signal.
+    // Rotate only OFFLINE sessions — changing a fingerprint on an ONLINE session causes a
+    // device-identity mismatch the moment it reconnects and is a ban signal. This is a
+    // deliberate security choice: a real phone does not change its model, so we only ever
+    // re-roll the profile of a session that is not currently linked.
     const sessions = await this.prisma.session.findMany({
       where: { status: SessionStatus.OFFLINE },
-      select: { id: true },
+      select: { id: true, fingerprint: true },
     });
 
-    for (const { id } of sessions) {
-      const fp = FINGERPRINT_POOL[Math.floor(Math.random() * FINGERPRINT_POOL.length)]!;
+    for (const { id, fingerprint } of sessions) {
+      const currentModel = (fingerprint as unknown as DeviceFingerprint | null)?.deviceModel;
+      const fp = this.pickProfile(currentModel); // ensure the rotation actually changes the profile
       await this.prisma.session.update({
         where: { id },
         data: { fingerprint: fp as unknown as Prisma.InputJsonValue },

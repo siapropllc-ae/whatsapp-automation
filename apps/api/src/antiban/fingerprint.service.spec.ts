@@ -96,7 +96,7 @@ describe('FingerprintService', () => {
       expect(mockPrisma.session.update).toHaveBeenCalledTimes(2);
       expect(mockPrisma.session.findMany).toHaveBeenCalledWith({
         where: { status: SessionStatus.OFFLINE },
-        select: { id: true },
+        select: { id: true, fingerprint: true },
       });
     });
 

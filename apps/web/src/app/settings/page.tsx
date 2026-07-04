@@ -126,7 +126,7 @@ function SendEngineTab() {
       )}
       <SectionTitle>Delay Settings</SectionTitle>
       <div style={{ marginBottom: 20 }}>
-        <SliderRow label="Min delay between messages" value={minDelay} min={30} max={300} unit="s" onChange={setMinDelay} />
+        <SliderRow label="Min delay between messages" value={minDelay} min={45} max={300} unit="s" onChange={setMinDelay} />
         <SliderRow label="Max delay between messages" value={maxDelay} min={minDelay} max={900} unit="s" onChange={(v) => setMaxDelay(Math.max(v, minDelay))} />
         <SliderRow label="Daily limit per session" value={dailyLimit} min={10} max={1000} onChange={setDailyLimit} />
       </div>
@@ -138,7 +138,7 @@ function SendEngineTab() {
   );
 }
 
-interface WarmupRow { fromDay: number; toDay: number | null; dailyCap: number; }
+interface WarmupRow { fromDay: number; toDay: number | null; dailyCap: number; strangerCap?: number; }
 interface WarmupScheduleData { schedule: WarmupRow[]; note: string; }
 
 function WarmupTab() {
@@ -162,8 +162,15 @@ function WarmupTab() {
               <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                 Day {row.fromDay}{row.toDay !== null ? `–${row.toDay}` : '+'}
               </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: '#25d366' }}>
-                {row.dailyCap} msg/day
+              <div style={{ display: 'flex', gap: 14, alignItems: 'baseline' }}>
+                {row.strangerCap !== undefined && (
+                  <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-muted)' }}>
+                    {row.strangerCap} cold
+                  </div>
+                )}
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#25d366', minWidth: 78, textAlign: 'right' }}>
+                  {row.dailyCap} msg/day
+                </div>
               </div>
             </div>
           ))}

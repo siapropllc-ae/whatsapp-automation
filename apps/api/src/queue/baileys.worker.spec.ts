@@ -24,7 +24,7 @@ const mockPrisma = {
   },
   session: {
     findUnique: jest.fn(),
-    update: jest.fn().mockResolvedValue({}),
+    update: jest.fn().mockResolvedValue({ consecutiveFailures: 1 }),
   },
   analyticsEvent: {
     create: jest.fn().mockResolvedValue({}),
@@ -33,18 +33,29 @@ const mockPrisma = {
 
 const mockSessions = {
   sendBaileyMessage: jest.fn().mockResolvedValue(undefined),
+  tripCircuitBreaker: jest.fn().mockResolvedValue(undefined),
 };
 
 const mockDelay = {
   isWithinActiveHours: jest.fn().mockReturnValue(true),
   msUntilNextWindow: jest.fn().mockReturnValue(3_600_000),
   msUntilMidnight: jest.fn().mockReturnValue(3_600_000),
+  msUntilNextHour: jest.fn().mockReturnValue(1_800_000),
+  requeueJitterMs: jest.fn().mockReturnValue(0),
+  computeDelayMs: jest.fn().mockReturnValue(60_000),
+  computeTypingMs: jest.fn().mockReturnValue(3_000),
+  hourlyCap: jest.fn().mockReturnValue(1000),
+  utcHourStamp: jest.fn().mockReturnValue('2026070512'),
+  computeBurstThreshold: jest.fn().mockReturnValue(1000),
+  computeBurstBreakMs: jest.fn().mockReturnValue(1_800_000),
   floorMs: 60_000,
+  meanMs: 120_000,
   typingMs: 3_000,
 };
 
 const mockWarmup = {
   getEffectiveDailyLimit: jest.fn().mockReturnValue(200),
+  getEffectiveStrangerLimit: jest.fn().mockReturnValue(200),
 };
 
 const mockGateway = {
@@ -55,9 +66,21 @@ const mockDlqQueue = {
   add: jest.fn().mockResolvedValue(undefined),
 };
 
+// Key-aware in-memory Redis so the worker's several keys (lastSent, hourly, breakUntil,
+// sinceBreak, breakThreshold) don't collide on a single mocked return value.
+let redisStore: Record<string, string>;
 const mockRedis = {
-  get: jest.fn().mockResolvedValue(null),
-  set: jest.fn().mockResolvedValue('OK'),
+  get: jest.fn((key: string) => Promise.resolve(redisStore[key] ?? null)),
+  set: jest.fn((key: string, val: string) => {
+    redisStore[key] = String(val);
+    return Promise.resolve('OK');
+  }),
+  incr: jest.fn((key: string) => {
+    const v = parseInt(redisStore[key] ?? '0', 10) + 1;
+    redisStore[key] = String(v);
+    return Promise.resolve(v);
+  }),
+  expire: jest.fn(() => Promise.resolve(1)),
 };
 
 function makeJobData(overrides: Partial<OutboxJob> = {}): OutboxJob {
@@ -90,21 +113,30 @@ describe('BaileysWorker', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    redisStore = {};
     mockPrisma.campaignMessage.findUnique.mockResolvedValue({ status: MsgStatus.QUEUED });
     mockPrisma.campaign.findUnique.mockResolvedValue({ status: 'RUNNING' });
     mockPrisma.session.findUnique.mockResolvedValue({
       dailySent: 0,
+      strangerSent: 0,
       warmupDay: 21,
       status: SessionStatus.ONLINE,
     });
+    mockPrisma.session.update.mockResolvedValue({ consecutiveFailures: 1 });
     mockPrisma.campaignMessage.count.mockResolvedValue(0);
     // jest.clearAllMocks() resets call history but NOT configured mockReturnValue —
     // re-pin every gate to its open/default state so tests can't leak into each other.
     mockDelay.isWithinActiveHours.mockReturnValue(true);
     mockDelay.msUntilNextWindow.mockReturnValue(3_600_000);
     mockDelay.msUntilMidnight.mockReturnValue(3_600_000);
+    mockDelay.msUntilNextHour.mockReturnValue(1_800_000);
+    mockDelay.requeueJitterMs.mockReturnValue(0);
+    mockDelay.computeDelayMs.mockReturnValue(60_000);
+    mockDelay.computeTypingMs.mockReturnValue(3_000);
+    mockDelay.hourlyCap.mockReturnValue(1000);
+    mockDelay.computeBurstThreshold.mockReturnValue(1000);
     mockWarmup.getEffectiveDailyLimit.mockReturnValue(200);
-    mockRedis.get.mockResolvedValue(null);
+    mockWarmup.getEffectiveStrangerLimit.mockReturnValue(200);
 
     const module = await Test.createTestingModule({
       providers: [
@@ -174,7 +206,7 @@ describe('BaileysWorker', () => {
     });
 
     it('requeues to the midnight reset and never sends when the session is at its daily cap', async () => {
-      mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 200, warmupDay: 21, status: SessionStatus.ONLINE });
+      mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 200, strangerSent: 0, warmupDay: 21, status: SessionStatus.ONLINE });
       mockWarmup.getEffectiveDailyLimit.mockReturnValue(200);
       mockDelay.msUntilMidnight.mockReturnValue(5_400_000);
       const job = makeJob(makeJobData());
@@ -186,7 +218,7 @@ describe('BaileysWorker', () => {
     });
 
     it('does NOT requeue when dailySent is one below the cap (boundary check)', async () => {
-      mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 199, warmupDay: 21, status: SessionStatus.ONLINE });
+      mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 199, strangerSent: 0, warmupDay: 21, status: SessionStatus.ONLINE });
       mockWarmup.getEffectiveDailyLimit.mockReturnValue(200);
 
       await worker.process(makeJob(makeJobData()));
@@ -194,15 +226,73 @@ describe('BaileysWorker', () => {
       expect(mockSessions.sendBaileyMessage).toHaveBeenCalledTimes(1);
     });
 
-    describe('Redis min-gap gate (anti-ban stranger multiplier)', () => {
+    describe('stranger sub-cap gate', () => {
+      it('requeues a cold first-contact message when the stranger cap is reached', async () => {
+        mockPrisma.campaignMessage.count.mockResolvedValue(0); // never messaged → stranger
+        mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 10, strangerSent: 35, warmupDay: 7, status: SessionStatus.ONLINE });
+        mockWarmup.getEffectiveStrangerLimit.mockReturnValue(35);
+        mockDelay.msUntilMidnight.mockReturnValue(5_400_000);
+        const job = makeJob(makeJobData());
+
+        await expect(worker.process(job)).rejects.toBeInstanceOf(DelayedError);
+
+        expect(job.moveToDelayed).toHaveBeenCalledWith(FIXED_NOW + 5_400_000, undefined);
+        expect(mockSessions.sendBaileyMessage).not.toHaveBeenCalled();
+      });
+
+      it('still sends to a known contact (not a stranger) even when the stranger cap is reached', async () => {
+        mockPrisma.campaignMessage.count.mockResolvedValue(2); // has prior sends → not a stranger
+        mockPrisma.session.findUnique.mockResolvedValue({ dailySent: 10, strangerSent: 35, warmupDay: 7, status: SessionStatus.ONLINE });
+        mockWarmup.getEffectiveStrangerLimit.mockReturnValue(35);
+
+        await worker.process(makeJob(makeJobData()));
+
+        expect(mockSessions.sendBaileyMessage).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('hourly cap gate', () => {
+      it('requeues to the next hour when the hourly cap is reached', async () => {
+        redisStore['session:hourly:session-1:2026070512'] = '40';
+        mockDelay.hourlyCap.mockReturnValue(40);
+        mockDelay.msUntilNextHour.mockReturnValue(1_200_000);
+        const job = makeJob(makeJobData());
+
+        await expect(worker.process(job)).rejects.toBeInstanceOf(DelayedError);
+
+        expect(job.moveToDelayed).toHaveBeenCalledWith(FIXED_NOW + 1_200_000, undefined);
+        expect(mockSessions.sendBaileyMessage).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('burst-break gate', () => {
+      it('requeues while the session is on a burst-break', async () => {
+        redisStore['session:breakUntil:session-1'] = String(FIXED_NOW + 600_000);
+        const job = makeJob(makeJobData());
+
+        await expect(worker.process(job)).rejects.toBeInstanceOf(DelayedError);
+
+        expect(job.moveToDelayed).toHaveBeenCalledWith(FIXED_NOW + 600_000, undefined);
+        expect(mockSessions.sendBaileyMessage).not.toHaveBeenCalled();
+      });
+
+      it('sends normally once the burst-break has elapsed', async () => {
+        redisStore['session:breakUntil:session-1'] = String(FIXED_NOW - 1_000);
+        await worker.process(makeJob(makeJobData()));
+        expect(mockSessions.sendBaileyMessage).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('Redis min-gap gate (Gaussian gap × stranger multiplier)', () => {
       it.each([
         [0, 2.5],
         [1, 1.8],
         [2, 1.0],
       ])('uses a %sx gap multiplier when the contact has %i prior sent message(s)', async (prevSentCount, multiplier) => {
         mockPrisma.campaignMessage.count.mockResolvedValue(prevSentCount);
+        mockDelay.computeDelayMs.mockReturnValue(60_000);
         const lastSent = FIXED_NOW - 1_000; // 1s ago — well within any of these gaps
-        mockRedis.get.mockResolvedValue(String(lastSent));
+        redisStore['session:lastSent:session-1'] = String(lastSent);
         const job = makeJob(makeJobData());
 
         await expect(worker.process(job)).rejects.toBeInstanceOf(DelayedError);
@@ -215,7 +305,6 @@ describe('BaileysWorker', () => {
 
       it('proceeds to send when there is no prior lastSent record on this session', async () => {
         mockPrisma.campaignMessage.count.mockResolvedValue(0);
-        mockRedis.get.mockResolvedValue(null);
 
         await worker.process(makeJob(makeJobData()));
 
@@ -224,7 +313,8 @@ describe('BaileysWorker', () => {
 
       it('proceeds to send once the elapsed time exactly meets the minimum gap', async () => {
         mockPrisma.campaignMessage.count.mockResolvedValue(0); // 2.5x multiplier -> minGap = 150_000
-        mockRedis.get.mockResolvedValue(String(FIXED_NOW - 150_000));
+        mockDelay.computeDelayMs.mockReturnValue(60_000);
+        redisStore['session:lastSent:session-1'] = String(FIXED_NOW - 150_000);
 
         await worker.process(makeJob(makeJobData()));
 
@@ -271,6 +361,14 @@ describe('BaileysWorker', () => {
       );
     });
 
+    it('uses a length-scaled typing duration from DelayService.computeTypingMs', async () => {
+      mockDelay.computeTypingMs.mockReturnValue(7_500);
+      await worker.process(makeJob(makeJobData({ renderedText: 'A much longer message body' })));
+
+      expect(mockDelay.computeTypingMs).toHaveBeenCalledWith('A much longer message body'.length);
+      expect(mockSessions.sendBaileyMessage).toHaveBeenCalledWith('session-1', '+15551234567', 'A much longer message body', 7_500, undefined);
+    });
+
     it('marks the message FAILED and rethrows when the send itself throws', async () => {
       mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('socket closed'));
 
@@ -283,10 +381,48 @@ describe('BaileysWorker', () => {
     });
   });
 
+  describe('circuit breaker', () => {
+    it('trips the breaker after the failure threshold and pauses the session campaigns', async () => {
+      mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('socket closed'));
+      mockPrisma.session.update.mockResolvedValueOnce({ consecutiveFailures: 5 });
+
+      await expect(worker.process(makeJob(makeJobData()))).rejects.toThrow('socket closed');
+
+      expect(mockSessions.tripCircuitBreaker).toHaveBeenCalledWith('session-1', 5);
+    });
+
+    it('does not trip the breaker below the threshold', async () => {
+      mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('socket closed'));
+      mockPrisma.session.update.mockResolvedValueOnce({ consecutiveFailures: 2 });
+
+      await expect(worker.process(makeJob(makeJobData()))).rejects.toThrow('socket closed');
+
+      expect(mockSessions.tripCircuitBreaker).not.toHaveBeenCalled();
+    });
+
+    it('resets the failure streak and counts a stranger send on success', async () => {
+      mockPrisma.campaignMessage.count.mockResolvedValue(0); // stranger
+
+      await worker.process(makeJob(makeJobData()));
+
+      expect(mockPrisma.session.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'session-1' },
+          data: expect.objectContaining({
+            dailySent: { increment: 1 },
+            consecutiveFailures: 0,
+            strangerSent: { increment: 1 },
+          }),
+        }),
+      );
+    });
+  });
+
   describe('session not ONLINE', () => {
     it('marks the job FAILED without attempting to send', async () => {
       mockPrisma.session.findUnique.mockResolvedValue({
         dailySent: 0,
+        strangerSent: 0,
         warmupDay: 21,
         status: SessionStatus.OFFLINE,
       });

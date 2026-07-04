@@ -10,7 +10,7 @@ const mockPrisma = {
   },
 };
 
-function makeModule(dailyLimit = 200) {
+function makeModule(dailyLimit = 1000) {
   return Test.createTestingModule({
     providers: [
       WarmupService,
@@ -32,59 +32,106 @@ describe('WarmupService', () => {
     service = module.get(WarmupService);
   });
 
-  // ── getEffectiveDailyLimit ───────────────────────────────────────────────
+  // ── getEffectiveDailyLimit (total cap) ───────────────────────────────────
 
-  describe('getEffectiveDailyLimit — warmup cap boundaries', () => {
+  describe('getEffectiveDailyLimit — total cap boundaries', () => {
     const cases: [warmupDay: number, expected: number][] = [
-      [0,  10],  // Day 0–2 band starts
-      [2,  10],  // Day 0–2 band ends
-      [3,  25],  // Day 3–5 band starts
-      [5,  25],  // Day 3–5 band ends
-      [6,  50],  // Day 6–9 band starts
-      [9,  50],  // Day 6–9 band ends
-      [10, 100], // Day 10–13 band starts
-      [13, 100], // Day 10–13 band ends
-      [14, 150], // Day 14–20 band starts
-      [20, 150], // Day 14–20 band ends
-      [21, 200], // Graduated — use env limit
-      [30, 200], // Well past graduation
+      [0, 15],
+      [2, 15],
+      [3, 35],
+      [6, 35],
+      [7, 60],
+      [10, 60],
+      [11, 100],
+      [14, 100],
+      [15, 160],
+      [19, 160],
+      [20, 250],
+      [24, 250],
+      [25, 400],
+      [29, 400],
+      [30, 600],
+      [34, 600],
+      [35, 800],
+      [39, 800],
+      [40, 1000], // graduated — env DAILY_SEND_LIMIT
+      [60, 1000],
     ];
 
-    it.each(cases)('warmupDay=%i → cap %i', (warmupDay, expected) => {
+    it.each(cases)('warmupDay=%i → total cap %i', (warmupDay, expected) => {
       expect(service.getEffectiveDailyLimit({ warmupDay, dailySent: 0 })).toBe(expected);
     });
   });
 
-  describe('getEffectiveDailyLimit — respects configured env limit for day 21+', () => {
-    it('uses 500 when DAILY_SEND_LIMIT=500', async () => {
-      const mod = await makeModule(500);
-      const svc = mod.get(WarmupService);
-      expect(svc.getEffectiveDailyLimit({ warmupDay: 21, dailySent: 0 })).toBe(500);
+  // ── getEffectiveStrangerLimit (cold sub-cap) ─────────────────────────────
+
+  describe('getEffectiveStrangerLimit — cold sub-cap boundaries', () => {
+    const cases: [warmupDay: number, expected: number][] = [
+      [0, 8],
+      [2, 8],
+      [3, 20],
+      [6, 20],
+      [7, 35],
+      [10, 35],
+      [11, 60],
+      [14, 60],
+      [15, 100],
+      [19, 100],
+      [20, 170],
+      [24, 170],
+      [25, 300],
+      [29, 300],
+      [30, 480],
+      [34, 480],
+      [35, 700],
+      [39, 700],
+      [40, 1000],
+    ];
+
+    it.each(cases)('warmupDay=%i → cold cap %i', (warmupDay, expected) => {
+      expect(service.getEffectiveStrangerLimit({ warmupDay, dailySent: 0 })).toBe(expected);
+    });
+
+    it('never exceeds the total daily cap', () => {
+      for (let day = 0; day <= 45; day++) {
+        const stranger = service.getEffectiveStrangerLimit({ warmupDay: day, dailySent: 0 });
+        const total = service.getEffectiveDailyLimit({ warmupDay: day, dailySent: 0 });
+        expect(stranger).toBeLessThanOrEqual(total);
+      }
     });
   });
 
-  // ── midnightReset (merged cron method) ──────────────────────────────────
+  describe('respects configured env limit for graduated (day 40+) sessions', () => {
+    it('uses 2000 when DAILY_SEND_LIMIT=2000', async () => {
+      const mod = await makeModule(2000);
+      const svc = mod.get(WarmupService);
+      expect(svc.getEffectiveDailyLimit({ warmupDay: 40, dailySent: 0 })).toBe(2000);
+      expect(svc.getEffectiveStrangerLimit({ warmupDay: 40, dailySent: 0 })).toBe(2000);
+    });
+  });
+
+  // ── midnightReset (idle-day-aware) ───────────────────────────────────────
 
   describe('midnightReset', () => {
-    it('increments warmupDay and resets dailySent for ONLINE sessions atomically', async () => {
-      mockPrisma.session.updateMany.mockResolvedValue({ count: 3 });
+    it('advances warmupDay only for ONLINE sessions that actually sent that day', async () => {
+      mockPrisma.session.updateMany.mockResolvedValue({ count: 0 });
 
       await service.midnightReset();
 
-      expect(mockPrisma.session.updateMany).toHaveBeenCalledWith({
-        where: { status: SessionStatus.ONLINE },
-        data: { warmupDay: { increment: 1 }, dailySent: 0 },
+      expect(mockPrisma.session.updateMany).toHaveBeenNthCalledWith(1, {
+        where: { status: SessionStatus.ONLINE, dailySent: { gt: 0 } },
+        data: { warmupDay: { increment: 1 } },
       });
     });
 
-    it('resets dailySent for non-ONLINE sessions without incrementing warmupDay', async () => {
-      mockPrisma.session.updateMany.mockResolvedValue({ count: 5 });
+    it('resets both daily counters for every session', async () => {
+      mockPrisma.session.updateMany.mockResolvedValue({ count: 0 });
 
       await service.midnightReset();
 
-      expect(mockPrisma.session.updateMany).toHaveBeenCalledWith({
-        where: { status: { not: SessionStatus.ONLINE } },
-        data: { dailySent: 0 },
+      expect(mockPrisma.session.updateMany).toHaveBeenNthCalledWith(2, {
+        where: {},
+        data: { dailySent: 0, strangerSent: 0 },
       });
     });
 

@@ -99,7 +99,11 @@ describe('SessionsService', () => {
       },
       campaignMessage: {
         findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
         update: jest.fn().mockResolvedValue({}),
+      },
+      campaign: {
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
     };
     const mockGateway = {
@@ -328,6 +332,47 @@ describe('SessionsService', () => {
       await (service as unknown as { handleInboundMessage: (s: string, p: string, t: string) => Promise<void> })
         .handleInboundMessage('sess-1', '+15551234567', text);
       expect(prisma.contact.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('pauseCampaignsForSession', () => {
+    it('pauses the RUNNING campaigns that still have queued work on the session', async () => {
+      (prisma.campaignMessage.findMany as jest.Mock).mockResolvedValue([
+        { campaignId: 'camp-1' },
+        { campaignId: 'camp-2' },
+      ]);
+      (prisma.campaign.updateMany as jest.Mock).mockResolvedValue({ count: 2 });
+
+      const paused = await service.pauseCampaignsForSession('sess-1');
+
+      expect(paused).toBe(2);
+      expect(prisma.campaign.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['camp-1', 'camp-2'] }, status: 'RUNNING' },
+        data: { status: 'PAUSED' },
+      });
+    });
+
+    it('does nothing when the session has no queued campaign messages', async () => {
+      (prisma.campaignMessage.findMany as jest.Mock).mockResolvedValue([]);
+
+      const paused = await service.pauseCampaignsForSession('sess-1');
+
+      expect(paused).toBe(0);
+      expect(prisma.campaign.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('tripCircuitBreaker', () => {
+    it('pauses the session campaigns when the failure threshold is hit', async () => {
+      (prisma.campaignMessage.findMany as jest.Mock).mockResolvedValue([{ campaignId: 'camp-1' }]);
+      (prisma.campaign.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+
+      await service.tripCircuitBreaker('sess-1', 5);
+
+      expect(prisma.campaign.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['camp-1'] }, status: 'RUNNING' },
+        data: { status: 'PAUSED' },
+      });
     });
   });
 
