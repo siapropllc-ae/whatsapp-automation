@@ -132,6 +132,7 @@ model Template {
   body      String // spin syntax: {Hi|Hello} {name}
   mediaUrl  String?
   category  String? // marketing | utility | auth | service
+  buttons   Json? // ButtonDef[] — quick-reply/URL/call buttons (see @wa-engine/shared)
   createdAt DateTime   @default(now())
   campaigns Campaign[]
 }
@@ -179,21 +180,24 @@ model CampaignMessage {
 }
 
 model Reply {
-  id         String   @id @default(cuid())
-  contactId  String
-  campaignId String?
-  text       String
-  sentiment  String? // HOT|WARM|COLD|NEGATIVE (AI)
-  intent     String? // BUYING|QUESTION|OBJECTION|OPT_OUT
-  score      Float?
-  handled    Boolean  @default(false)
-  createdAt  DateTime @default(now())
-  contact    Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
-  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  id          String   @id @default(cuid())
+  contactId   String
+  campaignId  String?
+  text        String
+  sentiment   String? // HOT|WARM|COLD|NEGATIVE (AI)
+  intent      String? // BUYING|QUESTION|OBJECTION|OPT_OUT
+  score       Float?
+  handled     Boolean  @default(false)
+  buttonId    String? // set when this reply is a recognized button tap (Cloud API webhook, Baileys native, or text-fallback match)
+  buttonLabel String? // the tapped button's display label, for UI/reporting
+  createdAt   DateTime @default(now())
+  contact     Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([contactId])
   @@index([sentiment])
   @@index([handled])
+  @@index([buttonId])
 }
 
 model Setting {

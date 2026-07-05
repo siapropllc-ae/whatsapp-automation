@@ -1,4 +1,5 @@
 import { MediaType, SessionMode } from '@prisma/client';
+import type { ButtonDef } from '@wa-engine/shared';
 
 export interface OutboxJob {
   campaignMessageId: string;
@@ -18,6 +19,8 @@ export interface OutboxJob {
   /** Required for Baileys document sends; unused by Cloud API (link-based header). */
   mediaMimeType?: string;
   mediaFilename?: string;
+  /** From the template's Template.buttons, if any — see CampaignsService.launch(). */
+  buttons?: ButtonDef[];
 }
 
 export interface DlqJob {

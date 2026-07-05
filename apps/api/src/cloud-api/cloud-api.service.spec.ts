@@ -153,5 +153,66 @@ describe('CloudApiService', () => {
         service.sendTemplate({ to: '+15551234567', templateName: 'hello_world' }),
       ).rejects.toThrow('returned no message id');
     });
+
+    describe('button components', () => {
+      async function sendAndCapturePayload(
+        buttons: Parameters<CloudApiService['sendTemplate']>[0]['buttons'],
+        headerMedia?: Parameters<CloudApiService['sendTemplate']>[0]['headerMedia'],
+      ): Promise<Record<string, unknown>> {
+        const mockResponse = {
+          ok: true,
+          json: jest.fn().mockResolvedValue({ messages: [{ id: 'wamid.btn' }] }),
+        };
+        const fetchSpy = jest
+          .spyOn(global, 'fetch' as never)
+          .mockResolvedValue(mockResponse as unknown as never);
+
+        await service.sendTemplate({ to: '+15551234567', templateName: 'hello_world', buttons, headerMedia });
+
+        // Some earlier tests in this suite don't restore their fetch spy, so `jest.spyOn`
+        // can return an already-mocked persistent spy with prior calls still recorded —
+        // grab the LAST call (this invocation), not the first.
+        const [, init] = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1] as [string, RequestInit];
+        fetchSpy.mockRestore();
+        return JSON.parse(init.body as string) as Record<string, unknown>;
+      }
+
+      it('emits a quick_reply component with a payload parameter carrying the button id', async () => {
+        const body = await sendAndCapturePayload([{ id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' }]);
+        const template = body.template as { components?: unknown[] };
+        expect(template.components).toEqual([
+          { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'yes-1' }] },
+        ]);
+      });
+
+      it('emits no components entry for URL buttons (static, nothing dynamic to send)', async () => {
+        const body = await sendAndCapturePayload([{ id: 'u1', type: 'URL', label: 'Visit', url: 'https://example.com' }]);
+        const template = body.template as { components?: unknown[] };
+        expect(template.components).toBeUndefined();
+      });
+
+      it('emits no components entry for CALL buttons', async () => {
+        const body = await sendAndCapturePayload([{ id: 'c1', type: 'CALL', label: 'Call us', phoneNumber: '+14155552671' }]);
+        const template = body.template as { components?: unknown[] };
+        expect(template.components).toBeUndefined();
+      });
+
+      it('concatenates header-media and button components', async () => {
+        const body = await sendAndCapturePayload(
+          [{ id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' }],
+          { type: 'IMAGE', url: 'https://example.com/pic.jpg' },
+        );
+        const template = body.template as { components?: Array<{ type: string }> };
+        expect(template.components).toHaveLength(2);
+        expect(template.components?.[0]?.type).toBe('header');
+        expect(template.components?.[1]?.type).toBe('button');
+      });
+
+      it('omits components entirely when neither header media nor buttons are present', async () => {
+        const body = await sendAndCapturePayload(undefined);
+        const template = body.template as { components?: unknown[] };
+        expect(template.components).toBeUndefined();
+      });
+    });
   });
 });

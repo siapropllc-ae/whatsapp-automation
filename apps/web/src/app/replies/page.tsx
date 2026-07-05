@@ -38,6 +38,14 @@ function SentimentBadge({ sentiment }: { sentiment: string | null }) {
   );
 }
 
+function ButtonTapBadge({ label }: { label: string }) {
+  return (
+    <span style={{ fontSize: 10, fontWeight: 600, color: '#25d366', background: 'rgba(37,211,102,0.1)', border: '1px solid rgba(37,211,102,0.2)', borderRadius: 6, padding: '2px 8px', letterSpacing: '0.4px', marginRight: 6, whiteSpace: 'nowrap' }}>
+      🔘 {label}
+    </span>
+  );
+}
+
 interface NewReplyEvent { contactId: string; phone: string; text: string; campaignId: string | null; at: string }
 
 function RepliesContent() {
@@ -165,7 +173,10 @@ function RepliesContent() {
                     </div>
                     {r.contactName && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{r.contactName}</div>}
                   </td>
-                  <td style={{ padding: '13px 18px', color: 'var(--text-secondary)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12 }}>{r.text}</td>
+                  <td style={{ padding: '13px 18px', color: 'var(--text-secondary)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12 }}>
+                    {r.buttonId && <ButtonTapBadge label={r.buttonLabel ?? r.buttonId} />}
+                    {r.text}
+                  </td>
                   <td style={{ padding: '13px 18px' }}><SentimentBadge sentiment={r.sentiment} /></td>
                   <td style={{ padding: '13px 18px', color: 'var(--text-muted)', fontSize: 11 }}>{r.intent ?? '—'}</td>
                   <td style={{ padding: '13px 18px', color: 'var(--text-muted)', fontSize: 11 }}>{formatDistanceToNow(new Date(r.createdAt), { addSuffix: true })}</td>

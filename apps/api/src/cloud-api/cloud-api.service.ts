@@ -1,12 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { ButtonDef } from '@wa-engine/shared';
 
 export interface TemplateParameter {
-  type: 'text' | 'currency' | 'date_time' | 'image' | 'document' | 'video';
+  type: 'text' | 'currency' | 'date_time' | 'image' | 'document' | 'video' | 'payload';
   text?: string;
   image?: { link: string };
   document?: { link: string; filename?: string };
   video?: { link: string };
+  payload?: string;
 }
 
 export interface TemplateComponent {
@@ -34,6 +36,11 @@ export interface SendTemplateOptions {
    * matching header type (image/document/video) — otherwise Meta rejects the send.
    */
   headerMedia?: HeaderMedia;
+  /**
+   * Quick-reply/URL/Call buttons. Only meaningful if `templateName` was approved in
+   * Meta Business Manager with a matching button structure — see buildButtonComponents.
+   */
+  buttons?: ButtonDef[];
 }
 
 export interface SendTemplateResult {
@@ -59,7 +66,12 @@ export class CloudApiService {
 
   async sendTemplate(opts: SendTemplateOptions): Promise<SendTemplateResult> {
     const phoneNumberId = opts.phoneNumberId ?? this.defaultPhoneNumberId;
-    const components = opts.components ?? this.buildHeaderMediaComponents(opts.headerMedia);
+    const components =
+      opts.components ??
+      [
+        ...(this.buildHeaderMediaComponents(opts.headerMedia) ?? []),
+        ...this.buildButtonComponents(opts.buttons),
+      ];
 
     if (this.isDryRun) {
       const wamid = `dry_wamid_${Date.now()}`;
@@ -123,5 +135,27 @@ export class CloudApiService {
           : { type: 'image', image: { link: headerMedia.url } };
 
     return [{ type: 'header', parameters: [parameter] }];
+  }
+
+  /**
+   * Builds Meta's `components` entries for buttons. Only QUICK_REPLY buttons need an
+   * entry (the button's `payload` — echoed back on the inbound webhook, wiring reply
+   * capture to the button that produced it). URL/CALL buttons are static in the
+   * approved template — nothing dynamic to send, so no components entry at all.
+   * Dynamic URL-suffix support is an explicit non-goal for v1.
+   */
+  private buildButtonComponents(buttons?: ButtonDef[]): TemplateComponent[] {
+    if (!buttons?.length) return [];
+    return buttons
+      .map((button, index): TemplateComponent | null => {
+        if (button.type !== 'QUICK_REPLY') return null;
+        return {
+          type: 'button',
+          sub_type: 'quick_reply',
+          index: String(index),
+          parameters: [{ type: 'payload', payload: button.id }],
+        };
+      })
+      .filter((c): c is TemplateComponent => c !== null);
   }
 }

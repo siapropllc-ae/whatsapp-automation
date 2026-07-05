@@ -10,9 +10,17 @@ import { EmptyState } from '@/components/EmptyState';
 import { CardSkeleton } from '@/components/Skeleton';
 import { useToast, ToastProvider } from '@/components/Toast';
 import { apiFetch } from '@/lib/api';
-import { spinText } from '@wa-engine/shared';
-import type { Template } from '@/types/api';
+import { spinText, validateButtons } from '@wa-engine/shared';
+import type { Template, ButtonDef, ButtonType } from '@/types/api';
 import { RE_TEMPLATES, RE_CATEGORIES } from '@/data/re-templates';
+import { ButtonPreview } from '@/components/ButtonPreview';
+
+const BUTTON_TYPES: { value: ButtonType; label: string }[] = [
+  { value: 'QUICK_REPLY', label: 'Quick Reply' },
+  { value: 'URL', label: 'Link' },
+  { value: 'CALL', label: 'Call' },
+];
+const MAX_BUTTONS = 3;
 
 const CATEGORIES = ['marketing', 'utility', 'auth', 'service'] as const;
 type Category = (typeof CATEGORIES)[number];
@@ -85,7 +93,14 @@ function TemplateCard({ template: t, onEdit, onDelete }: { template: Template; o
     <div className="glass glass-card-hover" style={{ borderRadius: 14, padding: '20px 22px', display: 'flex', flexDirection: 'column' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
         <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', flex: 1, marginRight: 10 }}>{t.name}</div>
-        <Badge variant={(t.category ?? 'marketing') as Parameters<typeof Badge>[0]['variant']} size="sm">{t.category ?? 'marketing'}</Badge>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {!!t.buttons?.length && (
+            <span title={`${t.buttons.length} button(s)`} style={{ fontSize: 10, color: '#25d366', background: 'rgba(37,211,102,0.08)', border: '1px solid rgba(37,211,102,0.15)', borderRadius: 10, padding: '2px 7px' }}>
+              🔘 {t.buttons.length}
+            </span>
+          )}
+          <Badge variant={(t.category ?? 'marketing') as Parameters<typeof Badge>[0]['variant']} size="sm">{t.category ?? 'marketing'}</Badge>
+        </div>
       </div>
       <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.6, maxHeight: 52, overflow: 'hidden' }} dangerouslySetInnerHTML={{ __html: highlightSpin(t.body) }} />
       <div style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 10, padding: '12px 14px', marginBottom: 16, flex: 1 }}>
@@ -157,6 +172,7 @@ function TemplatesContent() {
   const [category, setCategory] = useState<Category>('marketing');
   const [body, setBody] = useState('');
   const [mediaUrl, setMediaUrl] = useState('');
+  const [buttons, setButtons] = useState<ButtonDef[]>([]);
   const [saving, setSaving] = useState(false);
   const [preview, setPreview] = useState('');
 
@@ -172,24 +188,38 @@ function TemplatesContent() {
 
   const openModal = (t?: Template, prefill?: { name: string; body: string }) => {
     if (t) {
-      setEditTemplate(t); setName(t.name); setCategory((t.category as Category) ?? 'marketing'); setBody(t.body); setMediaUrl(t.mediaUrl ?? '');
+      setEditTemplate(t); setName(t.name); setCategory((t.category as Category) ?? 'marketing'); setBody(t.body); setMediaUrl(t.mediaUrl ?? ''); setButtons(t.buttons ?? []);
     } else {
       setEditTemplate(null);
       setName(prefill?.name ?? '');
       setCategory('marketing');
       setBody(prefill?.body ?? '');
       setMediaUrl('');
+      setButtons([]);
     }
     setModalOpen(true);
   };
 
+  const addButton = () => {
+    if (buttons.length >= MAX_BUTTONS) return;
+    setButtons([...buttons, { id: crypto.randomUUID(), type: 'QUICK_REPLY', label: '' }]);
+  };
+  const updateButton = (index: number, patch: Partial<ButtonDef>) => {
+    setButtons(buttons.map((b, i) => (i === index ? { ...b, ...patch } : b)));
+  };
+  const removeButton = (index: number) => {
+    setButtons(buttons.filter((_, i) => i !== index));
+  };
+  const cloudApiButtonCheck = useMemo(() => validateButtons(buttons, 'CLOUD_API'), [buttons]);
+
   const handleSave = async () => {
     setSaving(true);
     try {
+      const payload = { name, category, body, mediaUrl: mediaUrl || undefined, buttons: buttons.length ? buttons : undefined };
       if (editTemplate) {
-        await apiFetch(`/templates/${editTemplate.id}`, { method: 'PATCH', body: JSON.stringify({ name, category, body, mediaUrl: mediaUrl || undefined }) });
+        await apiFetch(`/templates/${editTemplate.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
       } else {
-        await apiFetch('/templates', { method: 'POST', body: JSON.stringify({ name, category, body, mediaUrl: mediaUrl || undefined }) });
+        await apiFetch('/templates', { method: 'POST', body: JSON.stringify(payload) });
       }
       toast('Template saved', 'success');
       setModalOpen(false);
@@ -377,11 +407,45 @@ function TemplatesContent() {
               <label style={labelStyle}>Media URL (optional)</label>
               <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)} placeholder="https://..." style={inputStyle} />
             </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <label style={{ ...labelStyle, marginBottom: 0 }}>Buttons (optional)</label>
+                <button
+                  onClick={addButton}
+                  disabled={buttons.length >= MAX_BUTTONS}
+                  style={{ background: 'rgba(37,211,102,0.1)', border: '1px solid rgba(37,211,102,0.2)', borderRadius: 6, color: '#25d366', cursor: buttons.length >= MAX_BUTTONS ? 'not-allowed' : 'pointer', opacity: buttons.length >= MAX_BUTTONS ? 0.4 : 1, width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  title="Add button"
+                >
+                  <IcPlus />
+                </button>
+              </div>
+              {buttons.map((b, i) => (
+                <div key={b.id} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
+                  <select value={b.type} onChange={(e) => updateButton(i, { type: e.target.value as ButtonType, url: undefined, phoneNumber: undefined })} style={{ ...inputStyle, width: 110, flexShrink: 0, fontSize: 11, padding: '8px 8px' }}>
+                    {BUTTON_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                  </select>
+                  <input value={b.label} onChange={(e) => updateButton(i, { label: e.target.value })} placeholder="Label" maxLength={20} style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
+                  {b.type === 'URL' && (
+                    <input value={b.url ?? ''} onChange={(e) => updateButton(i, { url: e.target.value })} placeholder="https://..." style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
+                  )}
+                  {b.type === 'CALL' && (
+                    <input value={b.phoneNumber ?? ''} onChange={(e) => updateButton(i, { phoneNumber: e.target.value })} placeholder="+1..." style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
+                  )}
+                  <button onClick={() => removeButton(i)} style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.1)', borderRadius: 7, color: '#ef4444', cursor: 'pointer', width: 28, height: 28, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><IcTrash /></button>
+                </div>
+              ))}
+              {!!buttons.length && !cloudApiButtonCheck.valid && (
+                <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 6, lineHeight: 1.5 }}>
+                  ⚠ Not valid for a Meta-approved Cloud API template: {cloudApiButtonCheck.errors.join(' ')} Fine for Baileys.
+                </div>
+              )}
+            </div>
           </div>
           <div>
             <label style={labelStyle}>Live Preview</label>
             <div style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 12, padding: 16, minHeight: 200, fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
               {preview || <span style={{ color: 'var(--text-muted)' }}>Preview will appear as you type...</span>}
+              <ButtonPreview buttons={buttons} />
             </div>
             <div style={{ marginTop: 10, background: 'rgba(37,211,102,0.05)', border: '1px solid rgba(37,211,102,0.1)', borderRadius: 8, padding: '8px 12px' }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>Rendered with</div>

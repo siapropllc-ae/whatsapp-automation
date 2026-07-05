@@ -6,7 +6,7 @@ import {
   SessionStatus,
 } from '@prisma/client';
 
-import { spinText, countSpinVariants } from '@wa-engine/shared';
+import { spinText, countSpinVariants, validateButtons, parseButtonDefs } from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
@@ -138,6 +138,20 @@ export class CampaignsService {
       throw new BadRequestException(
         'Campaign has no template — assign a message template before launching',
       );
+    }
+
+    // Strict, mode-aware check: a button combo that's fine for Baileys can still be
+    // invalid for a Cloud API template (Meta's real "quick-reply XOR CTA" rule), so this
+    // re-validates now that campaign.mode is known, even though templates.service.ts
+    // already ran a lenient check when the template was saved.
+    const buttons = parseButtonDefs(template.buttons);
+    if (buttons?.length) {
+      const result = validateButtons(buttons, campaign.mode);
+      if (!result.valid) {
+        throw new BadRequestException(
+          `Template "${template.name}" has an invalid button configuration for ${campaign.mode}: ${result.errors.join('; ')}`,
+        );
+      }
     }
 
     const contacts = await this.prisma.contact.findMany({
@@ -281,6 +295,7 @@ export class CampaignsService {
           mediaType: campaign.mediaType ?? undefined,
           mediaMimeType: campaign.mediaMimeType ?? undefined,
           mediaFilename: campaign.mediaFilename ?? undefined,
+          buttons,
         },
         { delay: totalDelay },
       );

@@ -11,9 +11,12 @@ import { type Prisma, type Session, CampaignStatus, MediaType, MsgStatus, Sessio
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
+  generateWAMessageFromContent,
   type ConnectionState,
+  type WAMessageContent,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
+import { parseButtonDefs, type ButtonDef } from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { FingerprintService } from '../antiban/fingerprint.service';
 import { ProxyService } from '../antiban/proxy.service';
@@ -294,7 +297,9 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         // Skip messages we sent ourselves
         if (msg.key.fromMe) continue;
         const jid = msg.key.remoteJid;
+        const nativeButton = this.extractNativeButtonResponse(msg.message);
         const text =
+          nativeButton?.text ??
           msg.message?.conversation ??
           msg.message?.extendedTextMessage?.text ??
           null;
@@ -305,7 +310,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
               this.log.debug(`[${sessionId}] inbound from unresolvable jid=${jid} — skipping`);
               return;
             }
-            return this.handleInboundMessage(sessionId, phone, text);
+            return this.handleInboundMessage(sessionId, phone, text, nativeButton?.buttonId);
           })
           .catch((err: unknown) => this.log.error(`inbound message error [${sessionId}]: ${String(err)}`));
       }
@@ -393,10 +398,71 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
+  /**
+   * Recognizes a tapped button reply, if any: the legacy `buttonsResponseMessage` shape
+   * (in case a recipient's client somehow replies via the old deprecated protocol), or the
+   * modern `interactiveResponseMessage.nativeFlowResponseMessage` shape — the counterpart to
+   * the buttons we send in `sendNativeFlowButtons`. `text` here is a placeholder (the real
+   * display label is resolved in `resolveButtonMatch` once we know which template sent it).
+   */
+  private extractNativeButtonResponse(
+    message: { buttonsResponseMessage?: { selectedButtonId?: string | null; selectedDisplayText?: string | null } | null; interactiveResponseMessage?: { nativeFlowResponseMessage?: { paramsJson?: string | null } | null } | null } | null | undefined,
+  ): { buttonId: string; text: string } | null {
+    const legacy = message?.buttonsResponseMessage;
+    if (legacy?.selectedButtonId) {
+      return { buttonId: legacy.selectedButtonId, text: legacy.selectedDisplayText ?? legacy.selectedButtonId };
+    }
+    const nativeFlow = message?.interactiveResponseMessage?.nativeFlowResponseMessage;
+    if (nativeFlow?.paramsJson) {
+      try {
+        const parsed = JSON.parse(nativeFlow.paramsJson) as { id?: string };
+        if (parsed.id) return { buttonId: parsed.id, text: parsed.id };
+      } catch {
+        // malformed JSON from the client — ignore, fall through to plain text
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Resolves a possible button match for an inbound reply against the buttons of the
+   * template that produced the contact's last sent message. Priority: (1) a native
+   * button-response id, matched against the template's ButtonDef.id; (2) a bare numeral
+   * matching the button's 1-based position; (3) a case-insensitive label match; (4) no
+   * match — ordinary free text. On a match, `text` is replaced with the button's real
+   * label (nicer than a raw native-flow id or a numeral the contact typed).
+   */
+  private resolveButtonMatch(
+    templateButtonsJson: unknown,
+    nativeButtonId: string | undefined,
+    incomingText: string,
+  ): { buttonId?: string; buttonLabel?: string; text: string } {
+    const buttons = parseButtonDefs(templateButtonsJson);
+    if (!buttons?.length) return { text: incomingText };
+
+    if (nativeButtonId) {
+      const match = buttons.find((b) => b.id === nativeButtonId);
+      if (match) return { buttonId: match.id, buttonLabel: match.label, text: match.label };
+      return { buttonId: nativeButtonId, text: incomingText };
+    }
+
+    const trimmed = incomingText.trim();
+    const asPosition = Number(trimmed);
+    if (Number.isInteger(asPosition) && asPosition >= 1 && asPosition <= buttons.length) {
+      const match = buttons[asPosition - 1]!;
+      return { buttonId: match.id, buttonLabel: match.label, text: match.label };
+    }
+    const byLabel = buttons.find((b) => b.label.toLowerCase() === trimmed.toLowerCase());
+    if (byLabel) return { buttonId: byLabel.id, buttonLabel: byLabel.label, text: byLabel.label };
+
+    return { text: incomingText };
+  }
+
   private async handleInboundMessage(
     sessionId: string,
     phone: string,
     text: string,
+    nativeButtonId?: string,
   ): Promise<void> {
     const contact = await this.prisma.contact.findUnique({ where: { phone } });
     if (!contact) {
@@ -411,13 +477,22 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         status: { in: [MsgStatus.SENT, MsgStatus.DELIVERED, MsgStatus.READ] },
       },
       orderBy: { sentAt: 'desc' },
+      include: { campaign: { include: { template: true } } },
     });
+
+    const { buttonId, buttonLabel, text: resolvedText } = this.resolveButtonMatch(
+      lastMsg?.campaign?.template?.buttons,
+      nativeButtonId,
+      text,
+    );
 
     await this.prisma.reply.create({
       data: {
         contactId: contact.id,
         campaignId: lastMsg?.campaignId ?? null,
-        text,
+        text: resolvedText,
+        buttonId,
+        buttonLabel,
       },
     });
 
@@ -428,8 +503,9 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    // Auto-invalidate contacts who signal opt-out — prevents continued sending after STOP
-    const lowerText = text.toLowerCase();
+    // Auto-invalidate contacts who signal opt-out — prevents continued sending after STOP.
+    // Runs against resolvedText, so a button labeled "Stop"/"Unsubscribe" is honoured for free.
+    const lowerText = resolvedText.toLowerCase();
     // Short keywords must match the WHOLE message — tokenising on word boundaries still
     // false-positives on "non-stop" (hyphen) and "bus stop" / "won't stop" (legit standalone word)
     const OPT_OUT_KEYWORDS = new Set(['stop', 'unsubscribe', 'optout']);
@@ -444,8 +520,8 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       this.log.log(`[${sessionId}] OPT_OUT from ${phone} — contact marked invalid`);
     }
 
-    this.gateway.emitReply(contact.id, phone, text, lastMsg?.campaignId ?? null);
-    this.log.log(`[${sessionId}] reply from ${phone}: "${text.slice(0, 60)}"`);
+    this.gateway.emitReply(contact.id, phone, resolvedText, lastMsg?.campaignId ?? null);
+    this.log.log(`[${sessionId}] reply from ${phone}: "${resolvedText.slice(0, 60)}"${buttonId ? ` [button=${buttonId}]` : ''}`);
   }
 
   private async handleMessageDelivered(sessionId: string, phone: string): Promise<void> {
@@ -651,6 +727,64 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Builds the plain-text numbered listing appended to every buttoned message — the
+   * safety net that keeps replies matchable even when the interactive render fails or
+   * isn't supported by the recipient's client. URL/Call buttons inline their raw
+   * url/phone number since a plain-text render has no tappable button.
+   */
+  private buildButtonListing(buttons: ButtonDef[]): string {
+    return buttons
+      .map((b, i) => {
+        const n = i + 1;
+        if (b.type === 'URL') return `${n}. ${b.label}: ${b.url}`;
+        if (b.type === 'CALL') return `${n}. ${b.label}: ${b.phoneNumber}`;
+        return `${n}. ${b.label}`;
+      })
+      .join('\n');
+  }
+
+  /**
+   * Attempts a real interactive button send using Baileys' raw NativeFlowMessage proto —
+   * the same wire shape the official WhatsApp Business App uses, but reached here via
+   * Baileys' documented "raw content" escape hatch (generateWAMessageFromContent +
+   * relayMessage), since there is no high-level sendMessage() shape for it. Throws on
+   * any failure — the caller is expected to fall back to a plain-text send.
+   */
+  private async sendNativeFlowButtons(
+    sock: ReturnType<typeof makeWASocket>,
+    jid: string,
+    bodyText: string,
+    buttons: ButtonDef[],
+  ): Promise<void> {
+    const nativeButtons = buttons.map((b) => ({
+      name: b.type === 'URL' ? 'cta_url' : b.type === 'CALL' ? 'cta_call' : 'quick_reply',
+      buttonParamsJson: JSON.stringify(
+        b.type === 'URL'
+          ? { display_text: b.label, url: b.url }
+          : b.type === 'CALL'
+            ? { display_text: b.label, phone_number: b.phoneNumber }
+            : { display_text: b.label, id: b.id },
+      ),
+    }));
+
+    const content = {
+      interactiveMessage: {
+        body: { text: bodyText },
+        nativeFlowMessage: { buttons: nativeButtons },
+      },
+    } as unknown as WAMessageContent;
+
+    const userJid = sock.user?.id;
+    if (!userJid) throw new Error('socket has no authenticated user — cannot build message');
+
+    const generated = generateWAMessageFromContent(jid, content, { userJid });
+    if (!generated.key?.id || !generated.message) {
+      throw new Error('generateWAMessageFromContent produced no message id/content');
+    }
+    await sock.relayMessage(jid, generated.message, { messageId: generated.key.id });
+  }
+
+  /**
    * Sends a text or media message via Baileys, preceded by a typing-presence signal.
    * Called exclusively by BaileysWorker — never call from a controller.
    */
@@ -660,10 +794,11 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     text: string,
     typingMs: number,
     media?: { url: string; type: MediaType; mimeType?: string; filename?: string },
+    buttons?: ButtonDef[],
   ): Promise<void> {
     if (this.dryRun) {
       this.log.log(
-        `[DRY_RUN] skipping Baileys send to ${phone}: "${text.slice(0, 80)}"${media ? ` [+${media.type}]` : ''}`,
+        `[DRY_RUN] skipping Baileys send to ${phone}: "${text.slice(0, 80)}"${media ? ` [+${media.type}]` : ''}${buttons?.length ? ` [+${buttons.length} buttons]` : ''}`,
       );
       return;
     }
@@ -673,22 +808,41 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     }
     await this.ensureLidResolved(sock, phone);
     const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+
     // WhatsApp hard limits — silently truncate rather than throw and lose the message.
     // Media captions are capped tighter (1024) than standalone text messages (4096).
+    // The button listing is load-bearing for reply-matching, so it's protected from
+    // truncation — the original body loses characters first, not the listing.
     const MAX_WA_CHARS = media ? 1024 : 4096;
-    const safeText = text.length > MAX_WA_CHARS ? text.slice(0, MAX_WA_CHARS) : text;
-    if (text.length > MAX_WA_CHARS) {
-      this.log.warn(`[${sessionId}] message truncated ${text.length}→${MAX_WA_CHARS} chars for ${phone}`);
+    const listing = buttons?.length ? this.buildButtonListing(buttons) : '';
+    const listingBlock = listing ? `\n\n${listing}` : '';
+    const availableForBody = Math.max(0, MAX_WA_CHARS - listingBlock.length);
+    const truncatedBody = text.length > availableForBody ? text.slice(0, availableForBody) : text;
+    const safeText = `${truncatedBody}${listingBlock}`;
+    if (text.length > availableForBody) {
+      this.log.warn(`[${sessionId}] message truncated ${text.length}→${availableForBody} chars for ${phone} (button listing preserved)`);
     }
+
     await sock.sendPresenceUpdate('composing', jid);
     await new Promise<void>((resolve) => setTimeout(resolve, typingMs));
     await sock.sendPresenceUpdate('paused', jid);
 
     if (!media) {
+      if (buttons?.length) {
+        try {
+          await this.sendNativeFlowButtons(sock, jid, safeText, buttons);
+          return;
+        } catch (err) {
+          this.log.warn(`[${sessionId}] native button send failed for ${phone}, falling back to plain text: ${String(err)}`);
+        }
+      }
       await sock.sendMessage(jid, { text: safeText });
       return;
     }
 
+    // Media + buttons: keep the (simpler, well-supported) media send and rely on the
+    // listing embedded in safeText/caption above — combining media with a native
+    // interactive send is not attempted, to avoid an unverified proto combination.
     const storedName = this.media.storedNameFromUrl(media.url);
     if (!storedName) {
       throw new Error(`Cannot resolve local path for media URL ${media.url}`);

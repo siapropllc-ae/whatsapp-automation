@@ -173,6 +173,7 @@ export class BaileysWorker extends WorkerHost {
               filename: job.data.mediaFilename,
             }
           : undefined,
+        job.data.buttons,
       );
 
       await this.prisma.campaignMessage.update({

@@ -398,6 +398,72 @@ describe('CampaignsService', () => {
     });
   });
 
+  // ── button validation + pass-through ──────────────────────────────────────
+
+  describe('launch() button handling', () => {
+    it('throws BadRequestException for a Cloud-API-invalid button combo on a CLOUD_API campaign', async () => {
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue({
+        ...makeCampaign(),
+        mode: SessionMode.CLOUD_API,
+      });
+      mockPrisma.template.findUnique.mockResolvedValue({
+        ...makeTemplate(),
+        // Mixing QUICK_REPLY with URL is invalid for Cloud API (never mixed)
+        buttons: [
+          { id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' },
+          { id: 'u1', type: 'URL', label: 'Visit', url: 'https://example.com' },
+        ],
+      });
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await expect(service.launch('camp-1', { contactIds: ['c1'] })).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockProducer.enqueue).not.toHaveBeenCalled();
+    });
+
+    it('passes valid buttons through to the enqueued job', async () => {
+      const buttons = [{ id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' }];
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign()); // BAILEYS mode
+      mockPrisma.template.findUnique.mockResolvedValue({ ...makeTemplate(), buttons });
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await service.launch('camp-1', { contactIds: ['c1'] });
+
+      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      expect(job['buttons']).toEqual(buttons);
+    });
+
+    it('applies the lenient BAILEYS cap correctly — allows a mixed combo that would fail Cloud API', async () => {
+      const buttons = [
+        { id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' },
+        { id: 'u1', type: 'URL', label: 'Visit', url: 'https://example.com' },
+      ];
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign()); // BAILEYS mode
+      mockPrisma.template.findUnique.mockResolvedValue({ ...makeTemplate(), buttons });
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await service.launch('camp-1', { contactIds: ['c1'] });
+
+      expect(mockProducer.enqueue).toHaveBeenCalledTimes(1);
+      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      expect(job['buttons']).toEqual(buttons);
+    });
+
+    it('passes buttons as undefined when the template has none', async () => {
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.template.findUnique.mockResolvedValue(makeTemplate());
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await service.launch('camp-1', { contactIds: ['c1'] });
+
+      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      expect(job['buttons']).toBeUndefined();
+    });
+  });
+
   // ── guard rails ───────────────────────────────────────────────────────────
 
   describe('launch guard rails', () => {

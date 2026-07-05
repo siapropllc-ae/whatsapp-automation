@@ -192,6 +192,94 @@ describe('WebhooksService', () => {
       );
     });
 
+    it('creates a Reply with buttonId/buttonLabel for a quick-reply button tap', async () => {
+      mockPrisma.contact.findUnique.mockResolvedValue({ id: 'contact-1', phone: '15551234567' });
+      mockPrisma.campaignMessage.findFirst.mockResolvedValue({
+        id: 'msg-1',
+        campaignId: 'campaign-1',
+        status: MsgStatus.DELIVERED,
+        sentAt: new Date(),
+      });
+      mockPrisma.reply.create.mockResolvedValue({});
+
+      const payload: MetaWebhookPayload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'WABA_ID',
+            changes: [
+              {
+                field: 'messages',
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: { display_phone_number: '15556783007', phone_number_id: '123456' },
+                  messages: [
+                    {
+                      from: '15551234567',
+                      id: 'wamid.btn1',
+                      timestamp: '1690000000',
+                      type: 'button',
+                      button: { payload: 'yes-1', text: 'Yes' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      await service.processCloudApiPayload(payload);
+
+      expect(mockPrisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Yes', buttonId: 'yes-1', buttonLabel: 'Yes' },
+      });
+    });
+
+    it('creates a Reply with buttonId/buttonLabel for a session-interactive button tap', async () => {
+      mockPrisma.contact.findUnique.mockResolvedValue({ id: 'contact-1', phone: '15551234567' });
+      mockPrisma.campaignMessage.findFirst.mockResolvedValue({
+        id: 'msg-1',
+        campaignId: 'campaign-1',
+        status: MsgStatus.DELIVERED,
+        sentAt: new Date(),
+      });
+      mockPrisma.reply.create.mockResolvedValue({});
+
+      const payload: MetaWebhookPayload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'WABA_ID',
+            changes: [
+              {
+                field: 'messages',
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: { display_phone_number: '15556783007', phone_number_id: '123456' },
+                  messages: [
+                    {
+                      from: '15551234567',
+                      id: 'wamid.interactive1',
+                      timestamp: '1690000000',
+                      type: 'interactive',
+                      interactive: { type: 'button_reply', button_reply: { id: 'no-1', title: 'No' } },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      await service.processCloudApiPayload(payload);
+
+      expect(mockPrisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No' },
+      });
+    });
+
     it('skips non-text messages silently', async () => {
       const payload: MetaWebhookPayload = {
         object: 'whatsapp_business_account',

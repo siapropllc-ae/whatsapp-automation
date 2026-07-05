@@ -339,6 +339,7 @@ describe('BaileysWorker', () => {
         'Hello there',
         3_000,
         undefined,
+        undefined,
       );
     });
 
@@ -358,6 +359,7 @@ describe('BaileysWorker', () => {
         'Hello there',
         3_000,
         { url: 'http://localhost:3001/api/media/a.jpg', type: MediaType.IMAGE, mimeType: 'image/jpeg', filename: 'a.jpg' },
+        undefined,
       );
     });
 
@@ -366,7 +368,21 @@ describe('BaileysWorker', () => {
       await worker.process(makeJob(makeJobData({ renderedText: 'A much longer message body' })));
 
       expect(mockDelay.computeTypingMs).toHaveBeenCalledWith('A much longer message body'.length);
-      expect(mockSessions.sendBaileyMessage).toHaveBeenCalledWith('session-1', '+15551234567', 'A much longer message body', 7_500, undefined);
+      expect(mockSessions.sendBaileyMessage).toHaveBeenCalledWith('session-1', '+15551234567', 'A much longer message body', 7_500, undefined, undefined);
+    });
+
+    it('passes the template buttons through to sendBaileyMessage when present', async () => {
+      const buttons = [{ id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' }];
+      await worker.process(makeJob(makeJobData({ buttons })));
+
+      expect(mockSessions.sendBaileyMessage).toHaveBeenCalledWith(
+        'session-1',
+        '+15551234567',
+        'Hello there',
+        3_000,
+        undefined,
+        buttons,
+      );
     });
 
     it('marks the message FAILED and rethrows when the send itself throws', async () => {

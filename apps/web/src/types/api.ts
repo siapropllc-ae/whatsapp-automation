@@ -1,3 +1,6 @@
+import type { ButtonDef } from '@wa-engine/shared';
+export type { ButtonDef, ButtonType } from '@wa-engine/shared';
+
 export interface OverviewResponse {
   activeSessions: number;
   messagesToday: number;
@@ -123,6 +126,7 @@ export interface Template {
   body: string;
   mediaUrl: string | null;
   category: string | null;
+  buttons: ButtonDef[] | null;
   createdAt: string;
 }
 
@@ -137,6 +141,8 @@ export interface Reply {
   intent: string | null;
   score: number | null;
   handled: boolean;
+  buttonId: string | null;
+  buttonLabel: string | null;
   createdAt: string;
 }
 

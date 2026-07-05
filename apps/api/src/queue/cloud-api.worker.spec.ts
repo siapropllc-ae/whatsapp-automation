@@ -346,6 +346,18 @@ describe('CloudApiWorker', () => {
         data: { status: MsgStatus.FAILED },
       });
     });
+
+    it('passes the template buttons through to sendTemplate when present', async () => {
+      const buttons = [{ id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' }];
+      await worker.process(makeJob(makeJobData({ buttons })));
+
+      expect(mockCloudApi.sendTemplate).toHaveBeenCalledWith({
+        to: '+15551234567',
+        templateName: 'welcome_template',
+        headerMedia: undefined,
+        buttons,
+      });
+    });
   });
 
   describe('circuit breaker', () => {

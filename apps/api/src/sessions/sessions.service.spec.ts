@@ -19,8 +19,13 @@ jest.mock('@whiskeysockets/baileys', () => ({
     user: { id: '15551234567:0@s.whatsapp.net' },
     logout: jest.fn().mockResolvedValue(undefined),
     requestPairingCode: jest.fn().mockResolvedValue('ABCD-1234'),
+    sendPresenceUpdate: jest.fn().mockResolvedValue(undefined),
+    sendMessage: jest.fn().mockResolvedValue(undefined),
+    relayMessage: jest.fn().mockResolvedValue(undefined),
+    onWhatsApp: jest.fn().mockResolvedValue([]),
   }),
   fetchLatestBaileysVersion: jest.fn().mockResolvedValue({ version: [2, 3000, 0], isLatest: true }),
+  generateWAMessageFromContent: jest.fn().mockReturnValue({ key: { id: 'wa-msg-1' }, message: {} }),
   DisconnectReason: { loggedOut: 401 },
   Browsers: { macOS: jest.fn().mockReturnValue(['Mac OS X', 'Safari', '16.4']) },
 }));
@@ -372,6 +377,119 @@ describe('SessionsService', () => {
       expect(prisma.campaign.updateMany).toHaveBeenCalledWith({
         where: { id: { in: ['camp-1'] }, status: 'RUNNING' },
         data: { status: 'PAUSED' },
+      });
+    });
+  });
+
+  describe('sendBaileyMessage buttons', () => {
+    let sock: { sendMessage: jest.Mock; relayMessage: jest.Mock; sendPresenceUpdate: jest.Mock };
+
+    beforeEach(async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      sock = makeWASocketMock.mock.results[makeWASocketMock.mock.results.length - 1]!.value;
+    });
+
+    it('sends a native interactive message via relayMessage and does not fall back to plain text', async () => {
+      const buttons = [
+        { id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' },
+        { id: 'no-1', type: 'QUICK_REPLY' as const, label: 'No' },
+      ];
+
+      await service.sendBaileyMessage('sess-1', '+15551234567', 'Are you interested?', 1, undefined, buttons);
+
+      expect(sock.relayMessage).toHaveBeenCalledWith('15551234567@s.whatsapp.net', {}, { messageId: 'wa-msg-1' });
+      expect(sock.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('falls back to a plain-text send with the numbered listing when the native send throws', async () => {
+      sock.relayMessage.mockRejectedValueOnce(new Error('relay failed'));
+      const buttons = [{ id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' }];
+
+      await service.sendBaileyMessage('sess-1', '+15551234567', 'Are you interested?', 1, undefined, buttons);
+
+      expect(sock.sendMessage).toHaveBeenCalledWith('15551234567@s.whatsapp.net', {
+        text: 'Are you interested?\n\n1. Yes',
+      });
+    });
+
+    it('prioritizes the button listing over the body when truncating a long message', async () => {
+      sock.relayMessage.mockRejectedValueOnce(new Error('force fallback for assertion'));
+      const longText = 'x'.repeat(5000);
+      const buttons = [{ id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' }];
+
+      await service.sendBaileyMessage('sess-1', '+15551234567', longText, 1, undefined, buttons);
+
+      const [, payload] = sock.sendMessage.mock.calls[sock.sendMessage.mock.calls.length - 1] as [string, { text: string }];
+      expect(payload.text.length).toBeLessThanOrEqual(4096);
+      expect(payload.text.endsWith('1. Yes')).toBe(true);
+    });
+
+    it('sends plain text with no listing when no buttons are provided', async () => {
+      await service.sendBaileyMessage('sess-1', '+15551234567', 'Hello', 1);
+
+      expect(sock.sendMessage).toHaveBeenCalledWith('15551234567@s.whatsapp.net', { text: 'Hello' });
+      expect(sock.relayMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('handleInboundMessage button matching', () => {
+    const buttons = [
+      { id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' },
+      { id: 'no-1', type: 'QUICK_REPLY' as const, label: 'No' },
+    ];
+
+    beforeEach(() => {
+      (prisma.contact.findUnique as jest.Mock).mockResolvedValue({ id: 'contact-1', phone: '+15551234567' });
+      (prisma.campaignMessage.findFirst as jest.Mock).mockResolvedValue({
+        id: 'msg-1',
+        campaignId: 'camp-1',
+        campaign: { template: { buttons } },
+      });
+    });
+
+    const callHandleInbound = (text: string, nativeButtonId?: string) =>
+      (service as unknown as { handleInboundMessage: (s: string, p: string, t: string, n?: string) => Promise<void> })
+        .handleInboundMessage('sess-1', '+15551234567', text, nativeButtonId);
+
+    it('matches a bare numeral to the button at that 1-based position', async () => {
+      await callHandleInbound('1');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'camp-1', text: 'Yes', buttonId: 'yes-1', buttonLabel: 'Yes' },
+      });
+    });
+
+    it('matches a case-insensitive label', async () => {
+      await callHandleInbound('no');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'camp-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No' },
+      });
+    });
+
+    it('matches a native button-response id over any text heuristic', async () => {
+      await callHandleInbound('ignored raw text', 'yes-1');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'camp-1', text: 'Yes', buttonId: 'yes-1', buttonLabel: 'Yes' },
+      });
+    });
+
+    it('falls back to plain text with no buttonId when nothing matches', async () => {
+      await callHandleInbound('sounds good, thanks');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: {
+          contactId: 'contact-1',
+          campaignId: 'camp-1',
+          text: 'sounds good, thanks',
+          buttonId: undefined,
+          buttonLabel: undefined,
+        },
       });
     });
   });

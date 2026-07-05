@@ -173,6 +173,7 @@ export class CloudApiWorker extends WorkerHost {
         headerMedia: job.data.mediaUrl && job.data.mediaType
           ? { type: job.data.mediaType, url: job.data.mediaUrl, filename: job.data.mediaFilename }
           : undefined,
+        buttons: job.data.buttons,
       });
 
       await this.prisma.campaignMessage.update({

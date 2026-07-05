@@ -12,6 +12,13 @@ export interface MetaInboundMessage {
   timestamp: string;
   type: string;
   text?: { body: string };
+  /** Tapped quick-reply template button (type === 'button'). */
+  button?: { payload: string; text: string };
+  /** Tapped session-interactive button (type === 'interactive'). */
+  interactive?: {
+    type: string;
+    button_reply?: { id: string; title: string };
+  };
 }
 
 export interface MetaContact {

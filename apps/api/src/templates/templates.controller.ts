@@ -1,8 +1,10 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post } from '@nestjs/common';
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsNotEmpty, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import type { Template } from '@prisma/client';
 import { TemplatesService } from './templates.service';
 import { CreateTemplateDto } from './dto/create-template.dto';
+import { ButtonDto } from './dto/button.dto';
 
 class UpdateTemplateDto {
   @IsOptional()
@@ -22,6 +24,12 @@ class UpdateTemplateDto {
   @IsOptional()
   @IsString()
   category?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ButtonDto)
+  buttons?: ButtonDto[];
 }
 
 @Controller('templates')

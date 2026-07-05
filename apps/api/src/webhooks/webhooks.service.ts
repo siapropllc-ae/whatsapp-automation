@@ -101,12 +101,33 @@ export class WebhooksService {
     }
   }
 
+  /**
+   * Resolves the text/buttonId/buttonLabel for an inbound message, recognizing Meta's
+   * two button-tap shapes before falling back to plain text. Both shapes carry the
+   * button's display text directly on the webhook payload, so — unlike Baileys' plain-text
+   * fallback matching — no lookup against the sent template is needed here.
+   */
+  private resolveInboundContent(
+    message: MetaInboundMessage,
+  ): { text: string; buttonId?: string; buttonLabel?: string } | null {
+    if (message.type === 'button' && message.button) {
+      return { text: message.button.text, buttonId: message.button.payload, buttonLabel: message.button.text };
+    }
+    if (message.type === 'interactive' && message.interactive?.button_reply) {
+      const { id, title } = message.interactive.button_reply;
+      return { text: title, buttonId: id, buttonLabel: title };
+    }
+    const body = message.text?.body;
+    return body ? { text: body } : null;
+  }
+
   private async handleInboundMessage(
     message: MetaInboundMessage,
     contacts: MetaContact[],
   ): Promise<void> {
-    const body = message.text?.body;
-    if (!body) return;
+    const resolved = this.resolveInboundContent(message);
+    if (!resolved) return;
+    const { text: body, buttonId, buttonLabel } = resolved;
 
     // Meta sends `from` without '+' prefix (e.g. "15551234567").
     // Contacts are stored in E.164 format with '+', so we normalise here.
@@ -134,6 +155,8 @@ export class WebhooksService {
         contactId: contact.id,
         campaignId: lastMsg?.campaignId ?? null,
         text: body,
+        buttonId,
+        buttonLabel,
       },
     });
 
