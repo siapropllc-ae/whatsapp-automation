@@ -857,7 +857,7 @@ function ContactsContent() {
       {/* Top bar */}
       <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginBottom: 20 }}>
         <Button variant="outline" loading={validateLoading} onClick={handleValidate}>Validate All</Button>
-        <Button variant="outline" onClick={() => { setImportSmartListId(null); setImportOpen(true); }}>Import Excel / CSV</Button>
+        <Button variant="outline" onClick={() => { setImportSmartListId(activeSmartListId); setImportOpen(true); }}>Import Excel / CSV</Button>
         <Button onClick={() => setAddOpen(true)}>+ Add Contact</Button>
       </div>
 
