@@ -5,6 +5,7 @@ import type { Template } from '@prisma/client';
 import { TemplatesService } from './templates.service';
 import { CreateTemplateDto } from './dto/create-template.dto';
 import { ButtonDto } from './dto/button.dto';
+import { CarouselCardDto } from './dto/carousel-card.dto';
 
 class UpdateTemplateDto {
   @IsOptional()
@@ -30,6 +31,12 @@ class UpdateTemplateDto {
   @ValidateNested({ each: true })
   @Type(() => ButtonDto)
   buttons?: ButtonDto[];
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CarouselCardDto)
+  carouselCards?: CarouselCardDto[];
 }
 
 @Controller('templates')

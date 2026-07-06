@@ -7,9 +7,10 @@ import { DashLayout } from '@/components/DashLayout';
 import { Button } from '@/components/Button';
 import { useToast, ToastProvider } from '@/components/Toast';
 import { apiFetch } from '@/lib/api';
-import { spinText, validateButtons } from '@wa-engine/shared';
+import { spinText, validateButtons, validateCarousel } from '@wa-engine/shared';
 import type { Template, SmartList, Session } from '@/types/api';
 import { ButtonPreview } from '@/components/ButtonPreview';
+import { CarouselPreview } from '@/components/CarouselPreview';
 
 const STEPS = ['Basics', 'Message', 'Contacts', 'Schedule', 'Review'];
 
@@ -339,11 +340,24 @@ function NewCampaignContent() {
                       <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
                         {spinText(selectedTemplate.body, { name: 'Demo', city: 'Karachi' })}
                       </div>
-                      {!!selectedTemplate.buttons?.length && <ButtonPreview buttons={selectedTemplate.buttons} />}
-                      {mode === 'CLOUD_API' && !!selectedTemplate.buttons?.length && !validateButtons(selectedTemplate.buttons, 'CLOUD_API').valid && (
-                        <div style={{ fontSize: 11, color: '#f59e0b', marginTop: 10, lineHeight: 1.5 }}>
-                          ⚠ This template&apos;s buttons need a matching approved Meta template before they&apos;ll work in Cloud API mode.
-                        </div>
+                      {selectedTemplate.carouselCards?.length ? (
+                        <>
+                          <CarouselPreview cards={selectedTemplate.carouselCards} />
+                          {!validateCarousel(selectedTemplate.carouselCards, mode).valid && (
+                            <div style={{ fontSize: 11, color: '#f59e0b', marginTop: 10, lineHeight: 1.5 }}>
+                              ⚠ This carousel needs a matching approved Meta carousel template before it&apos;ll work in Cloud API mode.
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          {!!selectedTemplate.buttons?.length && <ButtonPreview buttons={selectedTemplate.buttons} />}
+                          {mode === 'CLOUD_API' && !!selectedTemplate.buttons?.length && !validateButtons(selectedTemplate.buttons, 'CLOUD_API').valid && (
+                            <div style={{ fontSize: 11, color: '#f59e0b', marginTop: 10, lineHeight: 1.5 }}>
+                              ⚠ This template&apos;s buttons need a matching approved Meta template before they&apos;ll work in Cloud API mode.
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                   )}
@@ -552,7 +566,11 @@ function NewCampaignContent() {
                   { label: 'Mode', value: mode === 'CLOUD_API' ? 'Cloud API' : 'WebSocket' },
                   { label: 'Send From', value: onlineSessions.length === 0 ? 'No sessions online' : `${effectiveSessionIds.length} of ${onlineSessions.length} session(s)` },
                   { label: 'Message Source', value: sourceType === 'template' ? (selectedTemplate?.name ?? 'None selected') : `AI Generated (${aiMessages.length} messages)` },
-                  ...(selectedTemplate?.buttons?.length ? [{ label: 'Buttons', value: selectedTemplate.buttons.map((b) => b.label).join(', ') }] : []),
+                  ...(selectedTemplate?.carouselCards?.length
+                    ? [{ label: 'Carousel', value: `${selectedTemplate.carouselCards.length} cards` }]
+                    : selectedTemplate?.buttons?.length
+                      ? [{ label: 'Buttons', value: selectedTemplate.buttons.map((b) => b.label).join(', ') }]
+                      : []),
                   { label: 'Attachment', value: mediaFilename || 'None' },
                   { label: 'Smart List', value: selectedSmartList ? `${selectedSmartList.name} (${selectedSmartList.contactCount} contacts)` : 'None selected' },
                   { label: 'Active Hours', value: `${activeFrom}:00 – ${activeTo}:00` },

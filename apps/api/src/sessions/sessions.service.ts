@@ -16,7 +16,7 @@ import makeWASocket, {
   type WAMessageContent,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
-import { parseButtonDefs, type ButtonDef } from '@wa-engine/shared';
+import { parseButtonDefs, parseCarouselCards, type ButtonDef, type CarouselCardDef } from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { FingerprintService } from '../antiban/fingerprint.service';
 import { ProxyService } from '../antiban/proxy.service';
@@ -433,11 +433,10 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
    * label (nicer than a raw native-flow id or a numeral the contact typed).
    */
   private resolveButtonMatch(
-    templateButtonsJson: unknown,
+    buttons: ButtonDef[] | undefined,
     nativeButtonId: string | undefined,
     incomingText: string,
   ): { buttonId?: string; buttonLabel?: string; text: string } {
-    const buttons = parseButtonDefs(templateButtonsJson);
     if (!buttons?.length) return { text: incomingText };
 
     if (nativeButtonId) {
@@ -480,8 +479,16 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       include: { campaign: { include: { template: true } } },
     });
 
+    // Carousel-mode templates store buttons per-card (Template.buttons is null then) —
+    // flatten across cards so matching works the same as single-card mode. ButtonDef.id
+    // is globally unique (crypto.randomUUID()), so no card-scoping is needed here.
+    const template = lastMsg?.campaign?.template;
+    const templateButtons =
+      parseCarouselCards(template?.carouselCards)?.flatMap((c) => c.buttons) ??
+      parseButtonDefs(template?.buttons);
+
     const { buttonId, buttonLabel, text: resolvedText } = this.resolveButtonMatch(
-      lastMsg?.campaign?.template?.buttons,
+      templateButtons,
       nativeButtonId,
       text,
     );
@@ -732,10 +739,10 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
    * isn't supported by the recipient's client. URL/Call buttons inline their raw
    * url/phone number since a plain-text render has no tappable button.
    */
-  private buildButtonListing(buttons: ButtonDef[]): string {
+  private buildButtonListing(buttons: ButtonDef[], numeralOffset = 0): string {
     return buttons
       .map((b, i) => {
-        const n = i + 1;
+        const n = numeralOffset + i + 1;
         if (b.type === 'URL') return `${n}. ${b.label}: ${b.url}`;
         if (b.type === 'CALL') return `${n}. ${b.label}: ${b.phoneNumber}`;
         return `${n}. ${b.label}`;
@@ -860,6 +867,77 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         fileName: media.filename ?? 'file',
         caption: safeText,
       });
+    }
+  }
+
+  /**
+   * Sends a carousel as a sequence of real WhatsApp messages: a standalone intro text
+   * (the template's shared body), then each card as its own image/video + caption +
+   * button listing, reusing the same media/truncation machinery as sendBaileyMessage.
+   *
+   * There is no attempt at Baileys' raw CarouselMessage proto (nested InteractiveMessage
+   * cards with encrypted media inside each header) — it has zero precedent anywhere in
+   * the library, and even a correctly-built proto might never render as a swipeable
+   * carousel from a non-Cloud-API sender. This decomposition reuses 100% already-shipped
+   * code with zero new protocol risk, at the cost of "N separate bubbles" instead of one
+   * swipeable carousel. Card buttons are listing-only (never natively tappable) — the
+   * same policy sendBaileyMessage already applies whenever media is attached.
+   *
+   * Button numerals run as a GLOBAL offset across cards (card 1's buttons are 1..N, card
+   * 2's continue from N+1, etc.) rather than restarting at 1 per card, so a contact
+   * replying with a bare number is unambiguous regardless of which card it refers to.
+   */
+  async sendBaileyCarousel(
+    sessionId: string,
+    phone: string,
+    sharedBodyText: string,
+    typingMs: number,
+    cards: CarouselCardDef[],
+    interCardDelayMs = 1200,
+  ): Promise<void> {
+    if (this.dryRun) {
+      this.log.log(
+        `[DRY_RUN] skipping Baileys carousel send to ${phone}: intro="${sharedBodyText.slice(0, 80)}" cards=${cards.length}`,
+      );
+      return;
+    }
+    const sock = this.sockets.get(sessionId);
+    if (!sock) {
+      throw new Error(`Session ${sessionId} socket is not active`);
+    }
+    await this.ensureLidResolved(sock, phone);
+    const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+
+    await sock.sendPresenceUpdate('composing', jid);
+    await new Promise<void>((resolve) => setTimeout(resolve, typingMs));
+    await sock.sendPresenceUpdate('paused', jid);
+    await sock.sendMessage(jid, { text: sharedBodyText.slice(0, 4096) });
+
+    const MAX_CAPTION_CHARS = 1024;
+    let numeralOffset = 0;
+
+    for (const card of cards) {
+      await new Promise<void>((resolve) => setTimeout(resolve, interCardDelayMs));
+
+      const storedName = this.media.storedNameFromUrl(card.mediaUrl);
+      if (!storedName) {
+        throw new Error(`Cannot resolve local path for card media URL ${card.mediaUrl}`);
+      }
+      const buffer = await this.media.readFile(storedName);
+
+      const listing = card.buttons.length ? this.buildButtonListing(card.buttons, numeralOffset) : '';
+      const listingBlock = listing ? `\n\n${listing}` : '';
+      const availableForBody = Math.max(0, MAX_CAPTION_CHARS - listingBlock.length);
+      const truncatedBody = card.body.length > availableForBody ? card.body.slice(0, availableForBody) : card.body;
+      const caption = `${truncatedBody}${listingBlock}`;
+
+      if (card.mediaType === 'VIDEO') {
+        await sock.sendMessage(jid, { video: buffer, caption });
+      } else {
+        await sock.sendMessage(jid, { image: buffer, caption });
+      }
+
+      numeralOffset += card.buttons.length;
     }
   }
 

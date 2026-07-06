@@ -1,6 +1,14 @@
 import { Test, type TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { CloudApiService } from './cloud-api.service';
+import { MediaService } from '../media/media.service';
+
+function makeMedia() {
+  return {
+    readFile: jest.fn().mockResolvedValue(Buffer.from('fake-image-bytes')),
+    mimeTypeForStoredName: jest.fn().mockReturnValue('image/jpeg'),
+  };
+}
 
 function makeConfig(dryRun: boolean) {
   return {
@@ -27,6 +35,7 @@ describe('CloudApiService', () => {
         providers: [
           CloudApiService,
           { provide: ConfigService, useValue: makeConfig(true) },
+          { provide: MediaService, useValue: makeMedia() },
         ],
       }).compile();
       service = module.get<CloudApiService>(CloudApiService);
@@ -53,16 +62,27 @@ describe('CloudApiService', () => {
       });
       expect(result.dryRun).toBe(true);
     });
+
+    it('uploadMediaAsset returns a dry asset id without calling fetch', async () => {
+      const spy = jest.spyOn(global, 'fetch' as never);
+      const assetId = await service.uploadMediaAsset('a.jpg');
+      expect(assetId).toMatch(/^dry_asset_/);
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
   });
 
   describe('DRY_RUN=false', () => {
     let service: CloudApiService;
+    let media: ReturnType<typeof makeMedia>;
 
     beforeEach(async () => {
+      media = makeMedia();
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           CloudApiService,
           { provide: ConfigService, useValue: makeConfig(false) },
+          { provide: MediaService, useValue: media },
         ],
       }).compile();
       service = module.get<CloudApiService>(CloudApiService);
@@ -212,6 +232,71 @@ describe('CloudApiService', () => {
         const body = await sendAndCapturePayload(undefined);
         const template = body.template as { components?: unknown[] };
         expect(template.components).toBeUndefined();
+      });
+    });
+
+    describe('uploadMediaAsset', () => {
+      it('POSTs the file to Meta\'s /media endpoint and returns the asset id', async () => {
+        const mockResponse = { ok: true, json: jest.fn().mockResolvedValue({ id: 'meta-asset-123' }) };
+        const fetchSpy = jest.spyOn(global, 'fetch' as never).mockResolvedValue(mockResponse as unknown as never);
+
+        const assetId = await service.uploadMediaAsset('a.jpg');
+
+        expect(assetId).toBe('meta-asset-123');
+        expect(media.readFile).toHaveBeenCalledWith('a.jpg');
+        const [url, init] = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1] as [string, RequestInit];
+        expect(url).toContain('/media');
+        expect(init.method).toBe('POST');
+        fetchSpy.mockRestore();
+      });
+
+      it('throws when Meta returns no asset id', async () => {
+        const mockResponse = { ok: true, json: jest.fn().mockResolvedValue({}) };
+        jest.spyOn(global, 'fetch' as never).mockResolvedValue(mockResponse as unknown as never);
+
+        await expect(service.uploadMediaAsset('a.jpg')).rejects.toThrow('returned no asset id');
+      });
+    });
+
+    describe('carousel components', () => {
+      it('builds a carousel component with asset-id-based headers and per-card buttons', async () => {
+        const mockResponse = { ok: true, json: jest.fn().mockResolvedValue({ messages: [{ id: 'wamid.carousel' }] }) };
+        const fetchSpy = jest.spyOn(global, 'fetch' as never).mockResolvedValue(mockResponse as unknown as never);
+
+        await service.sendTemplate({
+          to: '+15551234567',
+          templateName: 'carousel_template',
+          carousel: {
+            cards: [
+              { id: 'c1', mediaUrl: 'http://x/a.jpg', body: 'A', buttons: [{ id: 'yes-1', type: 'QUICK_REPLY', label: 'Yes' }] },
+              { id: 'c2', mediaUrl: 'http://x/b.jpg', mediaType: 'VIDEO', body: 'B', buttons: [] },
+            ],
+            assetIds: ['asset-a', 'asset-b'],
+          },
+        });
+
+        const [, init] = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1] as [string, RequestInit];
+        const body = JSON.parse(init.body as string) as { template: { components: Array<Record<string, unknown>> } };
+        fetchSpy.mockRestore();
+
+        expect(body.template.components).toEqual([
+          {
+            type: 'carousel',
+            cards: [
+              {
+                card_index: 0,
+                components: [
+                  { type: 'header', parameters: [{ type: 'image', image: { id: 'asset-a' } }] },
+                  { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'yes-1' }] },
+                ],
+              },
+              {
+                card_index: 1,
+                components: [{ type: 'header', parameters: [{ type: 'video', video: { id: 'asset-b' } }] }],
+              },
+            ],
+          },
+        ]);
       });
     });
   });

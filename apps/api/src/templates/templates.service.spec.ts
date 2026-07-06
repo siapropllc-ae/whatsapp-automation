@@ -104,4 +104,59 @@ describe('TemplatesService', () => {
       });
     });
   });
+
+  describe('carousel validation + mode mutual exclusivity', () => {
+    const cards = [
+      { id: 'c1', mediaUrl: 'https://example.com/a.jpg', body: 'Card A', buttons: [] },
+      { id: 'c2', mediaUrl: 'https://example.com/b.jpg', body: 'Card B', buttons: [] },
+    ];
+
+    it('creates a template with a valid carousel and nulls buttons/mediaUrl', async () => {
+      (mockPrisma.template.create as jest.Mock).mockResolvedValue(mockTemplate);
+
+      await service.create({ name: 'Carousel', body: 'Intro', carouselCards: cards });
+
+      expect(mockPrisma.template.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          carouselCards: cards,
+          buttons: expect.anything(), // Prisma.JsonNull sentinel
+          mediaUrl: null,
+        }),
+      });
+    });
+
+    it('rejects a carousel with fewer than 2 cards on create', async () => {
+      await expect(
+        service.create({ name: 'Carousel', body: 'Intro', carouselCards: [cards[0]!] }),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.template.create).not.toHaveBeenCalled();
+    });
+
+    it('switching an existing carousel template to single-mode nulls carouselCards even with zero buttons', async () => {
+      (mockPrisma.template.update as jest.Mock).mockResolvedValue(mockTemplate);
+
+      // Frontend always sends `buttons` (even []) when saving in SINGLE mode, and omits
+      // carouselCards entirely — presence, not truthiness, is what buildModeFields keys off.
+      await service.update('t-1', { buttons: [], mediaUrl: 'https://example.com/new.jpg' });
+
+      expect(mockPrisma.template.update).toHaveBeenCalledWith({
+        where: { id: 't-1' },
+        data: expect.objectContaining({
+          buttons: [],
+          carouselCards: expect.anything(), // Prisma.JsonNull sentinel
+          mediaUrl: 'https://example.com/new.jpg',
+        }),
+      });
+    });
+
+    it('an update that only touches unrelated fields leaves buttons/carouselCards/mediaUrl untouched', async () => {
+      (mockPrisma.template.update as jest.Mock).mockResolvedValue(mockTemplate);
+
+      await service.update('t-1', { name: 'Renamed' });
+
+      const call = (mockPrisma.template.update as jest.Mock).mock.calls[0][0];
+      expect(call.data).not.toHaveProperty('buttons');
+      expect(call.data).not.toHaveProperty('carouselCards');
+    });
+  });
 });

@@ -1,4 +1,4 @@
-import { validateButtons, parseButtonDefs, type ButtonDef } from '@wa-engine/shared';
+import { validateButtons, validateSingleButton, parseButtonDefs, type ButtonDef } from '@wa-engine/shared';
 
 describe('validateButtons', () => {
   describe('structural checks (all modes)', () => {
@@ -123,6 +123,21 @@ describe('validateButtons', () => {
   it('is valid for an empty button list', () => {
     expect(validateButtons([], 'CLOUD_API').valid).toBe(true);
     expect(validateButtons([], 'BAILEYS').valid).toBe(true);
+  });
+});
+
+describe('validateSingleButton', () => {
+  // Extracted out of validateButtons so validateCarousel can reuse the same per-button
+  // field checks without pulling in validateButtons' mode-aggregate (XOR) rules.
+  it('is the same field-level check validateButtons uses — no id/label/url/phone', () => {
+    expect(validateSingleButton({ id: '', type: 'QUICK_REPLY', label: 'Yes' }).some((e) => e.includes('id'))).toBe(true);
+    expect(validateSingleButton({ id: 'b1', type: 'QUICK_REPLY', label: '' }).some((e) => e.includes('label'))).toBe(true);
+    expect(validateSingleButton({ id: 'u1', type: 'URL', label: 'Visit' }).some((e) => e.includes('missing a url'))).toBe(true);
+    expect(validateSingleButton({ id: 'c1', type: 'CALL', label: 'Call', phoneNumber: 'bad' }).some((e) => e.includes('E.164'))).toBe(true);
+  });
+
+  it('returns no errors for a well-formed button', () => {
+    expect(validateSingleButton({ id: 'q1', type: 'QUICK_REPLY', label: 'Yes' })).toEqual([]);
   });
 });
 

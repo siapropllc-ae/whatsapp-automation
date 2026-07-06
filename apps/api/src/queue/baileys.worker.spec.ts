@@ -33,6 +33,7 @@ const mockPrisma = {
 
 const mockSessions = {
   sendBaileyMessage: jest.fn().mockResolvedValue(undefined),
+  sendBaileyCarousel: jest.fn().mockResolvedValue(undefined),
   tripCircuitBreaker: jest.fn().mockResolvedValue(undefined),
 };
 
@@ -394,6 +395,33 @@ describe('BaileysWorker', () => {
         where: { id: 'msg-1' },
         data: { status: MsgStatus.FAILED },
       });
+    });
+  });
+
+  describe('carousel routing', () => {
+    it('routes to sendBaileyCarousel (not sendBaileyMessage) when the job has carouselCards', async () => {
+      const carouselCards = [
+        { id: 'c1', mediaUrl: 'http://x/a.jpg', body: 'A', buttons: [] },
+        { id: 'c2', mediaUrl: 'http://x/b.jpg', body: 'B', buttons: [] },
+      ];
+
+      await worker.process(makeJob(makeJobData({ carouselCards })));
+
+      expect(mockSessions.sendBaileyCarousel).toHaveBeenCalledWith(
+        'session-1',
+        '+15551234567',
+        'Hello there',
+        3_000,
+        carouselCards,
+      );
+      expect(mockSessions.sendBaileyMessage).not.toHaveBeenCalled();
+    });
+
+    it('routes to sendBaileyMessage (not sendBaileyCarousel) when the job has no carouselCards', async () => {
+      await worker.process(makeJob(makeJobData()));
+
+      expect(mockSessions.sendBaileyMessage).toHaveBeenCalledTimes(1);
+      expect(mockSessions.sendBaileyCarousel).not.toHaveBeenCalled();
     });
   });
 

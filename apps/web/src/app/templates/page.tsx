@@ -10,17 +10,21 @@ import { EmptyState } from '@/components/EmptyState';
 import { CardSkeleton } from '@/components/Skeleton';
 import { useToast, ToastProvider } from '@/components/Toast';
 import { apiFetch } from '@/lib/api';
-import { spinText, validateButtons } from '@wa-engine/shared';
-import type { Template, ButtonDef, ButtonType } from '@/types/api';
+import { spinText, validateCarousel } from '@wa-engine/shared';
+import type { Template, ButtonDef, CarouselCardDef } from '@/types/api';
 import { RE_TEMPLATES, RE_CATEGORIES } from '@/data/re-templates';
 import { ButtonPreview } from '@/components/ButtonPreview';
+import { ButtonListEditor } from '@/components/ButtonListEditor';
+import { CarouselCardEditor } from '@/components/CarouselCardEditor';
+import { CarouselPreview } from '@/components/CarouselPreview';
 
-const BUTTON_TYPES: { value: ButtonType; label: string }[] = [
-  { value: 'QUICK_REPLY', label: 'Quick Reply' },
-  { value: 'URL', label: 'Link' },
-  { value: 'CALL', label: 'Call' },
-];
 const MAX_BUTTONS = 3;
+const MIN_CARDS = 2;
+const MAX_CARDS = 10;
+
+function newCarouselCard(): CarouselCardDef {
+  return { id: crypto.randomUUID(), mediaUrl: '', body: '', buttons: [] };
+}
 
 const CATEGORIES = ['marketing', 'utility', 'auth', 'service'] as const;
 type Category = (typeof CATEGORIES)[number];
@@ -94,7 +98,11 @@ function TemplateCard({ template: t, onEdit, onDelete }: { template: Template; o
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
         <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', flex: 1, marginRight: 10 }}>{t.name}</div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          {!!t.buttons?.length && (
+          {t.carouselCards?.length ? (
+            <span title={`Carousel: ${t.carouselCards.length} cards`} style={{ fontSize: 10, color: '#25d366', background: 'rgba(37,211,102,0.08)', border: '1px solid rgba(37,211,102,0.15)', borderRadius: 10, padding: '2px 7px' }}>
+              🎠 {t.carouselCards.length} cards
+            </span>
+          ) : !!t.buttons?.length && (
             <span title={`${t.buttons.length} button(s)`} style={{ fontSize: 10, color: '#25d366', background: 'rgba(37,211,102,0.08)', border: '1px solid rgba(37,211,102,0.15)', borderRadius: 10, padding: '2px 7px' }}>
               🔘 {t.buttons.length}
             </span>
@@ -168,11 +176,13 @@ function TemplatesContent() {
   // My Templates modal state
   const [modalOpen, setModalOpen] = useState(false);
   const [editTemplate, setEditTemplate] = useState<Template | null>(null);
+  const [mode, setMode] = useState<'SINGLE' | 'CAROUSEL'>('SINGLE');
   const [name, setName] = useState('');
   const [category, setCategory] = useState<Category>('marketing');
   const [body, setBody] = useState('');
   const [mediaUrl, setMediaUrl] = useState('');
   const [buttons, setButtons] = useState<ButtonDef[]>([]);
+  const [carouselCards, setCarouselCards] = useState<CarouselCardDef[]>([]);
   const [saving, setSaving] = useState(false);
   const [preview, setPreview] = useState('');
 
@@ -188,34 +198,47 @@ function TemplatesContent() {
 
   const openModal = (t?: Template, prefill?: { name: string; body: string }) => {
     if (t) {
-      setEditTemplate(t); setName(t.name); setCategory((t.category as Category) ?? 'marketing'); setBody(t.body); setMediaUrl(t.mediaUrl ?? ''); setButtons(t.buttons ?? []);
+      setEditTemplate(t);
+      setMode(t.carouselCards?.length ? 'CAROUSEL' : 'SINGLE');
+      setName(t.name); setCategory((t.category as Category) ?? 'marketing'); setBody(t.body); setMediaUrl(t.mediaUrl ?? ''); setButtons(t.buttons ?? []);
+      setCarouselCards(t.carouselCards ?? []);
     } else {
       setEditTemplate(null);
+      setMode('SINGLE');
       setName(prefill?.name ?? '');
       setCategory('marketing');
       setBody(prefill?.body ?? '');
       setMediaUrl('');
       setButtons([]);
+      setCarouselCards([]);
     }
     setModalOpen(true);
   };
 
-  const addButton = () => {
-    if (buttons.length >= MAX_BUTTONS) return;
-    setButtons([...buttons, { id: crypto.randomUUID(), type: 'QUICK_REPLY', label: '' }]);
+  const addCard = () => {
+    if (carouselCards.length >= MAX_CARDS) return;
+    setCarouselCards([...carouselCards, newCarouselCard()]);
   };
-  const updateButton = (index: number, patch: Partial<ButtonDef>) => {
-    setButtons(buttons.map((b, i) => (i === index ? { ...b, ...patch } : b)));
+  const updateCard = (index: number, patch: Partial<CarouselCardDef>) => {
+    setCarouselCards(carouselCards.map((c, i) => (i === index ? { ...c, ...patch } : c)));
   };
-  const removeButton = (index: number) => {
-    setButtons(buttons.filter((_, i) => i !== index));
+  const removeCard = (index: number) => {
+    setCarouselCards(carouselCards.filter((_, i) => i !== index));
   };
-  const cloudApiButtonCheck = useMemo(() => validateButtons(buttons, 'CLOUD_API'), [buttons]);
+  const carouselCheck = useMemo(() => validateCarousel(carouselCards, 'ANY'), [carouselCards]);
 
   const handleSave = async () => {
     setSaving(true);
     try {
-      const payload = { name, category, body, mediaUrl: mediaUrl || undefined, buttons: buttons.length ? buttons : undefined };
+      // The backend's mutual-exclusivity logic keys off which of buttons/carouselCards
+      // is PRESENT in the request body (JSON.stringify drops undefined-valued keys, so
+      // this genuinely omits the other field rather than sending an empty array for
+      // it). The active mode's field is always sent, even empty, so "clear my buttons"
+      // still clears — an absent key would leave the other mode's stale data untouched.
+      const payload =
+        mode === 'CAROUSEL'
+          ? { name, category, body, carouselCards, buttons: undefined, mediaUrl: undefined }
+          : { name, category, body, mediaUrl: mediaUrl || undefined, buttons, carouselCards: undefined };
       if (editTemplate) {
         await apiFetch(`/templates/${editTemplate.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
       } else {
@@ -384,6 +407,20 @@ function TemplatesContent() {
 
       {/* Create / Edit Modal */}
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editTemplate ? 'Edit Template' : 'New Template'} width={700}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+          <button
+            onClick={() => setMode('SINGLE')}
+            style={{ flex: 1, padding: '8px 14px', borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', border: `1px solid ${mode === 'SINGLE' ? 'rgba(37,211,102,0.3)' : 'rgba(255,255,255,0.06)'}`, background: mode === 'SINGLE' ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)', color: mode === 'SINGLE' ? '#25d366' : 'var(--text-muted)' }}
+          >
+            Single Message
+          </button>
+          <button
+            onClick={() => setMode('CAROUSEL')}
+            style={{ flex: 1, padding: '8px 14px', borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', border: `1px solid ${mode === 'CAROUSEL' ? 'rgba(37,211,102,0.3)' : 'rgba(255,255,255,0.06)'}`, background: mode === 'CAROUSEL' ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)', color: mode === 'CAROUSEL' ? '#25d366' : 'var(--text-muted)' }}
+          >
+            🎠 Carousel (2-10 cards)
+          </button>
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 22 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <div>
@@ -397,55 +434,54 @@ function TemplatesContent() {
               </select>
             </div>
             <div>
-              <label style={labelStyle}>Message body</label>
-              <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={7} placeholder="{Hi|Hello} {name}! Check out our offer..." style={{ ...inputStyle, height: 'auto', resize: 'vertical' as const, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }} />
+              <label style={labelStyle}>{mode === 'CAROUSEL' ? 'Intro text (shared across all cards)' : 'Message body'}</label>
+              <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={mode === 'CAROUSEL' ? 3 : 7} placeholder="{Hi|Hello} {name}! Check out our offer..." style={{ ...inputStyle, height: 'auto', resize: 'vertical' as const, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }} />
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.6 }}>
                 <span style={{ color: '#25d366' }}>{'{opt1|opt2}'}</span> spin · <span style={{ color: '#25d366' }}>{'{name}'} {'{city}'}</span> vars
               </div>
             </div>
-            <div>
-              <label style={labelStyle}>Media URL (optional)</label>
-              <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)} placeholder="https://..." style={inputStyle} />
-            </div>
-            <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                <label style={{ ...labelStyle, marginBottom: 0 }}>Buttons (optional)</label>
-                <button
-                  onClick={addButton}
-                  disabled={buttons.length >= MAX_BUTTONS}
-                  style={{ background: 'rgba(37,211,102,0.1)', border: '1px solid rgba(37,211,102,0.2)', borderRadius: 6, color: '#25d366', cursor: buttons.length >= MAX_BUTTONS ? 'not-allowed' : 'pointer', opacity: buttons.length >= MAX_BUTTONS ? 0.4 : 1, width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                  title="Add button"
-                >
-                  <IcPlus />
-                </button>
+
+            {mode === 'SINGLE' ? (
+              <>
+                <div>
+                  <label style={labelStyle}>Media URL (optional)</label>
+                  <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)} placeholder="https://..." style={inputStyle} />
+                </div>
+                <ButtonListEditor buttons={buttons} onChange={setButtons} maxButtons={MAX_BUTTONS} showCloudApiWarning />
+              </>
+            ) : (
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <label style={{ ...labelStyle, marginBottom: 0 }}>Cards ({carouselCards.length}/{MAX_CARDS})</label>
+                  <button
+                    onClick={addCard}
+                    disabled={carouselCards.length >= MAX_CARDS}
+                    style={{ background: 'rgba(37,211,102,0.1)', border: '1px solid rgba(37,211,102,0.2)', borderRadius: 6, color: '#25d366', cursor: carouselCards.length >= MAX_CARDS ? 'not-allowed' : 'pointer', opacity: carouselCards.length >= MAX_CARDS ? 0.4 : 1, fontSize: 11, padding: '4px 10px' }}
+                  >
+                    + Add card
+                  </button>
+                </div>
+                {carouselCards.map((card, i) => (
+                  <CarouselCardEditor key={card.id} card={card} index={i} onChange={(patch) => updateCard(i, patch)} onRemove={() => removeCard(i)} />
+                ))}
+                {carouselCards.length < MIN_CARDS && (
+                  <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 4 }}>
+                    A carousel needs at least {MIN_CARDS} cards.
+                  </div>
+                )}
+                {!!carouselCards.length && !carouselCheck.valid && (
+                  <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 4, lineHeight: 1.5 }}>
+                    ⚠ {carouselCheck.errors.join(' ')}
+                  </div>
+                )}
               </div>
-              {buttons.map((b, i) => (
-                <div key={b.id} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
-                  <select value={b.type} onChange={(e) => updateButton(i, { type: e.target.value as ButtonType, url: undefined, phoneNumber: undefined })} style={{ ...inputStyle, width: 110, flexShrink: 0, fontSize: 11, padding: '8px 8px' }}>
-                    {BUTTON_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
-                  </select>
-                  <input value={b.label} onChange={(e) => updateButton(i, { label: e.target.value })} placeholder="Label" maxLength={20} style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
-                  {b.type === 'URL' && (
-                    <input value={b.url ?? ''} onChange={(e) => updateButton(i, { url: e.target.value })} placeholder="https://..." style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
-                  )}
-                  {b.type === 'CALL' && (
-                    <input value={b.phoneNumber ?? ''} onChange={(e) => updateButton(i, { phoneNumber: e.target.value })} placeholder="+1..." style={{ ...inputStyle, fontSize: 12, padding: '8px 10px' }} />
-                  )}
-                  <button onClick={() => removeButton(i)} style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.1)', borderRadius: 7, color: '#ef4444', cursor: 'pointer', width: 28, height: 28, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><IcTrash /></button>
-                </div>
-              ))}
-              {!!buttons.length && !cloudApiButtonCheck.valid && (
-                <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 6, lineHeight: 1.5 }}>
-                  ⚠ Not valid for a Meta-approved Cloud API template: {cloudApiButtonCheck.errors.join(' ')} Fine for Baileys.
-                </div>
-              )}
-            </div>
+            )}
           </div>
           <div>
             <label style={labelStyle}>Live Preview</label>
             <div style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 12, padding: 16, minHeight: 200, fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
               {preview || <span style={{ color: 'var(--text-muted)' }}>Preview will appear as you type...</span>}
-              <ButtonPreview buttons={buttons} />
+              {mode === 'SINGLE' ? <ButtonPreview buttons={buttons} /> : <CarouselPreview cards={carouselCards} />}
             </div>
             <div style={{ marginTop: 10, background: 'rgba(37,211,102,0.05)', border: '1px solid rgba(37,211,102,0.1)', borderRadius: 8, padding: '8px 12px' }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>Rendered with</div>
@@ -455,7 +491,13 @@ function TemplatesContent() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 22, paddingTop: 18, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
           <Button variant="outline" onClick={() => setModalOpen(false)}>Cancel</Button>
-          <Button loading={saving} onClick={handleSave} disabled={!name || !body}>Save Template</Button>
+          <Button
+            loading={saving}
+            onClick={handleSave}
+            disabled={!name || !body || (mode === 'CAROUSEL' && !carouselCheck.valid)}
+          >
+            Save Template
+          </Button>
         </div>
       </Modal>
     </DashLayout>

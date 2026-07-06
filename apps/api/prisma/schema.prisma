@@ -127,14 +127,15 @@ model SmartListContact {
 }
 
 model Template {
-  id        String     @id @default(cuid())
-  name      String
-  body      String // spin syntax: {Hi|Hello} {name}
-  mediaUrl  String?
-  category  String? // marketing | utility | auth | service
-  buttons   Json? // ButtonDef[] — quick-reply/URL/call buttons (see @wa-engine/shared)
-  createdAt DateTime   @default(now())
-  campaigns Campaign[]
+  id            String     @id @default(cuid())
+  name          String
+  body          String // spin syntax: {Hi|Hello} {name} — also the carousel's shared intro text
+  mediaUrl      String?
+  category      String? // marketing | utility | auth | service
+  buttons       Json? // ButtonDef[] — quick-reply/URL/call buttons (see @wa-engine/shared). Mutually exclusive with carouselCards.
+  carouselCards Json? // CarouselCardDef[] — 2-10 cards, each with its own media/body/buttons. Mutually exclusive with buttons/mediaUrl.
+  createdAt     DateTime   @default(now())
+  campaigns     Campaign[]
 }
 
 model Campaign {

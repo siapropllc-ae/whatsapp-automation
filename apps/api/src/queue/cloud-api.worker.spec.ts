@@ -358,6 +358,34 @@ describe('CloudApiWorker', () => {
         buttons,
       });
     });
+
+    it('passes carouselCards/carouselCardAssetIds through as the carousel option when present', async () => {
+      const carouselCards = [
+        { id: 'c1', mediaUrl: 'http://x/a.jpg', body: 'A', buttons: [] },
+        { id: 'c2', mediaUrl: 'http://x/b.jpg', body: 'B', buttons: [] },
+      ];
+      const carouselCardAssetIds = ['asset-a', 'asset-b'];
+      await worker.process(makeJob(makeJobData({ carouselCards, carouselCardAssetIds })));
+
+      expect(mockCloudApi.sendTemplate).toHaveBeenCalledWith({
+        to: '+15551234567',
+        templateName: 'welcome_template',
+        headerMedia: undefined,
+        buttons: undefined,
+        carousel: { cards: carouselCards, assetIds: carouselCardAssetIds },
+      });
+    });
+
+    it('omits the carousel option when the job has no carouselCards', async () => {
+      await worker.process(makeJob(makeJobData()));
+
+      expect(mockCloudApi.sendTemplate).toHaveBeenCalledWith({
+        to: '+15551234567',
+        templateName: 'welcome_template',
+        headerMedia: undefined,
+        carousel: undefined,
+      });
+    });
   });
 
   describe('circuit breaker', () => {

@@ -1,5 +1,5 @@
 import { MediaType, SessionMode } from '@prisma/client';
-import type { ButtonDef } from '@wa-engine/shared';
+import type { ButtonDef, CarouselCardDef } from '@wa-engine/shared';
 
 export interface OutboxJob {
   campaignMessageId: string;
@@ -21,6 +21,10 @@ export interface OutboxJob {
   mediaFilename?: string;
   /** From the template's Template.buttons, if any — see CampaignsService.launch(). */
   buttons?: ButtonDef[];
+  /** Carousel mode: parsed from Template.carouselCards, present instead of `buttons`. */
+  carouselCards?: CarouselCardDef[];
+  /** Cloud API carousel sends only: Meta media asset ids, index-aligned with carouselCards, uploaded once at launch. */
+  carouselCardAssetIds?: string[];
 }
 
 export interface DlqJob {

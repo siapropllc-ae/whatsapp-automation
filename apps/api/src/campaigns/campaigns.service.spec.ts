@@ -8,6 +8,8 @@ import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
 import { OutboxProducer } from '../queue/outbox.producer';
 import { SmartListsService } from '../smart-lists/smart-lists.service';
+import { MediaService } from '../media/media.service';
+import { CloudApiService } from '../cloud-api/cloud-api.service';
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -106,6 +108,14 @@ const mockSmartLists = {
   resolveContactIds: jest.fn().mockResolvedValue([]),
 };
 
+const mockMedia = {
+  storedNameFromUrl: jest.fn((url: string) => url.split('/').pop() ?? null),
+};
+
+const mockCloudApi = {
+  uploadMediaAsset: jest.fn().mockImplementation((storedName: string) => Promise.resolve(`asset-${storedName}`)),
+};
+
 // ── suite ────────────────────────────────────────────────────────────────────
 
 describe('CampaignsService', () => {
@@ -135,6 +145,8 @@ describe('CampaignsService', () => {
         { provide: WarmupService, useValue: mockWarmup },
         { provide: OutboxProducer, useValue: mockProducer },
         { provide: SmartListsService, useValue: mockSmartLists },
+        { provide: MediaService, useValue: mockMedia },
+        { provide: CloudApiService, useValue: mockCloudApi },
         {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(undefined) },
@@ -461,6 +473,61 @@ describe('CampaignsService', () => {
 
       const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
       expect(job['buttons']).toBeUndefined();
+    });
+  });
+
+  // ── carousel launch handling ───────────────────────────────────────────────
+
+  describe('launch() carousel handling', () => {
+    const carouselCards = [
+      { id: 'card1', mediaUrl: 'http://localhost:3001/api/media/a.jpg', body: 'Card A', buttons: [] },
+      { id: 'card2', mediaUrl: 'http://localhost:3001/api/media/b.jpg', body: 'Card B', buttons: [] },
+    ];
+
+    it('uploads each card asset exactly once per launch (not per contact) in CLOUD_API mode', async () => {
+      const contacts = ['c1', 'c2', 'c3'].map(makeContact);
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue({
+        ...makeCampaign(),
+        mode: SessionMode.CLOUD_API,
+      });
+      mockPrisma.template.findUnique.mockResolvedValue({ ...makeTemplate(), carouselCards });
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
+
+      expect(mockCloudApi.uploadMediaAsset).toHaveBeenCalledTimes(2); // once per card, not per contact
+      expect(mockProducer.enqueue).toHaveBeenCalledTimes(3); // once per contact
+
+      const jobs = (mockProducer.enqueue.mock.calls as Array<[Record<string, unknown>, unknown]>).map(([job]) => job);
+      for (const job of jobs) {
+        expect(job['carouselCardAssetIds']).toEqual(['asset-a.jpg', 'asset-b.jpg']);
+        expect(job['carouselCards']).toEqual(carouselCards);
+      }
+    });
+
+    it('never calls uploadMediaAsset in BAILEYS mode', async () => {
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign()); // BAILEYS
+      mockPrisma.template.findUnique.mockResolvedValue({ ...makeTemplate(), carouselCards });
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await service.launch('camp-1', { contactIds: ['c1'] });
+
+      expect(mockCloudApi.uploadMediaAsset).not.toHaveBeenCalled();
+      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      expect(job['carouselCards']).toEqual(carouselCards);
+      expect(job['carouselCardAssetIds']).toBeUndefined();
+    });
+
+    it('throws BadRequestException for an invalid carousel (fewer than 2 cards)', async () => {
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.template.findUnique.mockResolvedValue({ ...makeTemplate(), carouselCards: [carouselCards[0]] });
+      mockPrisma.contact.findMany.mockResolvedValue([makeContact('c1')]);
+      mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
+
+      await expect(service.launch('camp-1', { contactIds: ['c1'] })).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockProducer.enqueue).not.toHaveBeenCalled();
     });
   });
 

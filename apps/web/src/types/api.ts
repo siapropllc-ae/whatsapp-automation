@@ -1,5 +1,5 @@
-import type { ButtonDef } from '@wa-engine/shared';
-export type { ButtonDef, ButtonType } from '@wa-engine/shared';
+import type { ButtonDef, CarouselCardDef } from '@wa-engine/shared';
+export type { ButtonDef, ButtonType, CarouselCardDef } from '@wa-engine/shared';
 
 export interface OverviewResponse {
   activeSessions: number;
@@ -127,6 +127,7 @@ export interface Template {
   mediaUrl: string | null;
   category: string | null;
   buttons: ButtonDef[] | null;
+  carouselCards: CarouselCardDef[] | null;
   createdAt: string;
 }
 

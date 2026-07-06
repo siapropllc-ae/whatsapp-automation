@@ -6,12 +6,21 @@ import {
   SessionStatus,
 } from '@prisma/client';
 
-import { spinText, countSpinVariants, validateButtons, parseButtonDefs } from '@wa-engine/shared';
+import {
+  spinText,
+  countSpinVariants,
+  validateButtons,
+  parseButtonDefs,
+  validateCarousel,
+  parseCarouselCards,
+} from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
 import { OutboxProducer } from '../queue/outbox.producer';
 import { SmartListsService } from '../smart-lists/smart-lists.service';
+import { MediaService } from '../media/media.service';
+import { CloudApiService } from '../cloud-api/cloud-api.service';
 import { type CreateCampaignDto } from './dto/create-campaign.dto';
 import { type LaunchCampaignDto } from './dto/launch-campaign.dto';
 
@@ -59,6 +68,8 @@ export class CampaignsService {
     private readonly warmup: WarmupService,
     private readonly producer: OutboxProducer,
     private readonly smartLists: SmartListsService,
+    private readonly media: MediaService,
+    private readonly cloudApi: CloudApiService,
   ) {}
 
   async create(dto: CreateCampaignDto): Promise<Campaign> {
@@ -152,6 +163,36 @@ export class CampaignsService {
           `Template "${template.name}" has an invalid button configuration for ${campaign.mode}: ${result.errors.join('; ')}`,
         );
       }
+    }
+
+    const carouselCards = parseCarouselCards(template.carouselCards);
+    if (carouselCards?.length) {
+      const result = validateCarousel(carouselCards, campaign.mode);
+      if (!result.valid) {
+        throw new BadRequestException(
+          `Template "${template.name}" has an invalid carousel configuration: ${result.errors.join('; ')}`,
+        );
+      }
+    }
+
+    // Upload each card's image to Meta ONCE per launch (not per contact) — the same
+    // card image is identical across every recipient, and per-contact upload would
+    // waste Meta's media-API rate limit on any campaign over a few hundred contacts.
+    // Carousel header components need Meta's asset id, not a plain link (unlike
+    // single-card headers) — see CloudApiService.uploadMediaAsset.
+    let carouselCardAssetIds: string[] | undefined;
+    if (carouselCards?.length && campaign.mode === 'CLOUD_API') {
+      carouselCardAssetIds = await Promise.all(
+        carouselCards.map(async (card) => {
+          const storedName = this.media.storedNameFromUrl(card.mediaUrl);
+          if (!storedName) {
+            throw new BadRequestException(
+              `Card media URL is not a locally-hosted upload: ${card.mediaUrl}`,
+            );
+          }
+          return this.cloudApi.uploadMediaAsset(storedName);
+        }),
+      );
     }
 
     const contacts = await this.prisma.contact.findMany({
@@ -296,6 +337,8 @@ export class CampaignsService {
           mediaMimeType: campaign.mediaMimeType ?? undefined,
           mediaFilename: campaign.mediaFilename ?? undefined,
           buttons,
+          carouselCards,
+          carouselCardAssetIds,
         },
         { delay: totalDelay },
       );

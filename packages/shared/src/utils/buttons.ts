@@ -14,6 +14,30 @@ export interface ButtonValidationResult {
 }
 
 /**
+ * Validates a single button's own fields (id/label/url/phoneNumber), independent of
+ * what other buttons are in the list or which mode they're being sent through. Shared
+ * by validateButtons (flat single-card lists) and validateCarousel (per-card lists).
+ */
+export function validateSingleButton(button: ButtonDef): string[] {
+  const errors: string[] = [];
+  if (!button.id?.trim()) errors.push('Every button needs an id.');
+  if (!button.label?.trim()) errors.push('Every button needs a label.');
+  if (button.label && button.label.length > MAX_LABEL_LENGTH) {
+    errors.push(`Button label "${button.label}" exceeds ${MAX_LABEL_LENGTH} characters.`);
+  }
+  if (button.type === 'URL' && !button.url?.trim()) {
+    errors.push(`URL button "${button.label}" is missing a url.`);
+  }
+  if (button.type === 'CALL' && !isValidE164(button.phoneNumber ?? '')) {
+    errors.push(`Call button "${button.label}" needs a valid E.164 phone number.`);
+  }
+  if (button.type === 'QUICK_REPLY' && (button.url || button.phoneNumber)) {
+    errors.push(`Quick-reply button "${button.label}" must not have a url/phoneNumber.`);
+  }
+  return errors;
+}
+
+/**
  * Validates a button list against WhatsApp's real structural rules.
  *
  * Meta's Cloud API templates allow EITHER up to 3 quick-reply buttons OR up to
@@ -25,24 +49,7 @@ export function validateButtons(
   buttons: ButtonDef[],
   mode: ButtonValidationMode,
 ): ButtonValidationResult {
-  const errors: string[] = [];
-
-  for (const button of buttons) {
-    if (!button.id?.trim()) errors.push('Every button needs an id.');
-    if (!button.label?.trim()) errors.push('Every button needs a label.');
-    if (button.label && button.label.length > MAX_LABEL_LENGTH) {
-      errors.push(`Button label "${button.label}" exceeds ${MAX_LABEL_LENGTH} characters.`);
-    }
-    if (button.type === 'URL' && !button.url?.trim()) {
-      errors.push(`URL button "${button.label}" is missing a url.`);
-    }
-    if (button.type === 'CALL' && !isValidE164(button.phoneNumber ?? '')) {
-      errors.push(`Call button "${button.label}" needs a valid E.164 phone number.`);
-    }
-    if (button.type === 'QUICK_REPLY' && (button.url || button.phoneNumber)) {
-      errors.push(`Quick-reply button "${button.label}" must not have a url/phoneNumber.`);
-    }
-  }
+  const errors: string[] = buttons.flatMap(validateSingleButton);
 
   if (mode === 'CLOUD_API') {
     const quickReplyCount = buttons.filter((b) => b.type === 'QUICK_REPLY').length;

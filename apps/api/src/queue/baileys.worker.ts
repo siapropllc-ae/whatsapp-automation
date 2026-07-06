@@ -160,21 +160,31 @@ export class BaileysWorker extends WorkerHost {
     }
 
     try {
-      await this.sessions.sendBaileyMessage(
-        job.data.sessionId,
-        job.data.phone,
-        job.data.renderedText,
-        this.delay.computeTypingMs(job.data.renderedText.length),
-        job.data.mediaUrl && job.data.mediaType
-          ? {
-              url: job.data.mediaUrl,
-              type: job.data.mediaType,
-              mimeType: job.data.mediaMimeType,
-              filename: job.data.mediaFilename,
-            }
-          : undefined,
-        job.data.buttons,
-      );
+      if (job.data.carouselCards?.length) {
+        await this.sessions.sendBaileyCarousel(
+          job.data.sessionId,
+          job.data.phone,
+          job.data.renderedText,
+          this.delay.computeTypingMs(job.data.renderedText.length),
+          job.data.carouselCards,
+        );
+      } else {
+        await this.sessions.sendBaileyMessage(
+          job.data.sessionId,
+          job.data.phone,
+          job.data.renderedText,
+          this.delay.computeTypingMs(job.data.renderedText.length),
+          job.data.mediaUrl && job.data.mediaType
+            ? {
+                url: job.data.mediaUrl,
+                type: job.data.mediaType,
+                mimeType: job.data.mediaMimeType,
+                filename: job.data.mediaFilename,
+              }
+            : undefined,
+          job.data.buttons,
+        );
+      }
 
       await this.prisma.campaignMessage.update({
         where: { id: job.data.campaignMessageId },

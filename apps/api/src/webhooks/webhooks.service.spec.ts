@@ -280,6 +280,54 @@ describe('WebhooksService', () => {
       });
     });
 
+    it('resolves a carousel card\'s button tap identically to a single-card button (no template lookup involved)', async () => {
+      // Locks in the claim that carousel support needed zero webhook-side code changes:
+      // resolveInboundContent reads button/interactive fields straight off the inbound
+      // message — it never looks at which template (single-card or carousel) produced
+      // the tap, so a carousel card's button_reply arrives in the exact same shape.
+      mockPrisma.contact.findUnique.mockResolvedValue({ id: 'contact-1', phone: '15551234567' });
+      mockPrisma.campaignMessage.findFirst.mockResolvedValue({
+        id: 'msg-1',
+        campaignId: 'campaign-1',
+        status: MsgStatus.DELIVERED,
+        sentAt: new Date(),
+      });
+      mockPrisma.reply.create.mockResolvedValue({});
+
+      const payload: MetaWebhookPayload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'WABA_ID',
+            changes: [
+              {
+                field: 'messages',
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: { display_phone_number: '15556783007', phone_number_id: '123456' },
+                  messages: [
+                    {
+                      from: '15551234567',
+                      id: 'wamid.carousel-card2-btn',
+                      timestamp: '1690000000',
+                      type: 'interactive',
+                      interactive: { type: 'button_reply', button_reply: { id: 'card2-btn-1', title: 'Book Now' } },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      await service.processCloudApiPayload(payload);
+
+      expect(mockPrisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Book Now', buttonId: 'card2-btn-1', buttonLabel: 'Book Now' },
+      });
+    });
+
     it('skips non-text messages silently', async () => {
       const payload: MetaWebhookPayload = {
         object: 'whatsapp_business_account',

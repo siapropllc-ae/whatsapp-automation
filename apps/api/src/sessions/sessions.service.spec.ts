@@ -82,6 +82,7 @@ describe('SessionsService', () => {
   let service: SessionsService;
   let prisma: jest.Mocked<PrismaService>;
   let gateway: jest.Mocked<SessionsGateway>;
+  let media: { storedNameFromUrl: jest.Mock; readFile: jest.Mock };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -144,6 +145,7 @@ describe('SessionsService', () => {
     service = module.get<SessionsService>(SessionsService);
     prisma = module.get(PrismaService);
     gateway = module.get(SessionsGateway);
+    media = module.get(MediaService);
   });
 
   describe('onModuleInit', () => {
@@ -436,6 +438,74 @@ describe('SessionsService', () => {
     });
   });
 
+  describe('sendBaileyCarousel', () => {
+    let sock: { sendMessage: jest.Mock; relayMessage: jest.Mock; sendPresenceUpdate: jest.Mock };
+
+    const cards = [
+      {
+        id: 'card1',
+        mediaUrl: 'http://localhost:3001/api/media/a.jpg',
+        mediaType: 'IMAGE' as const,
+        body: 'Card A',
+        buttons: [
+          { id: 'b1', type: 'QUICK_REPLY' as const, label: 'Yes' },
+          { id: 'b2', type: 'QUICK_REPLY' as const, label: 'No' },
+        ],
+      },
+      {
+        id: 'card2',
+        mediaUrl: 'http://localhost:3001/api/media/b.jpg',
+        mediaType: 'IMAGE' as const,
+        body: 'Card B',
+        buttons: [{ id: 'b3', type: 'QUICK_REPLY' as const, label: 'Maybe' }],
+      },
+    ];
+
+    beforeEach(async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      sock = makeWASocketMock.mock.results[makeWASocketMock.mock.results.length - 1]!.value;
+
+      media.storedNameFromUrl.mockImplementation((url: string) => url.split('/').pop() ?? null);
+      media.readFile.mockResolvedValue(Buffer.from('fake-bytes'));
+    });
+
+    it('sends a standalone intro message, then each card as its own image with a globally-numbered button listing', async () => {
+      // interCardDelayMs=0 keeps the test fast — production default (1200ms) is unrelated to this behavior
+      await service.sendBaileyCarousel('sess-1', '+15551234567', 'Check these out!', 1, cards, 0);
+
+      const jid = '15551234567@s.whatsapp.net';
+      expect(sock.sendMessage).toHaveBeenNthCalledWith(1, jid, { text: 'Check these out!' });
+      expect(sock.sendMessage).toHaveBeenNthCalledWith(2, jid, {
+        image: Buffer.from('fake-bytes'),
+        caption: 'Card A\n\n1. Yes\n2. No',
+      });
+      // Card 2's button numeral continues from card 1's count (3), not restarting at 1
+      expect(sock.sendMessage).toHaveBeenNthCalledWith(3, jid, {
+        image: Buffer.from('fake-bytes'),
+        caption: 'Card B\n\n3. Maybe',
+      });
+    });
+
+    it('sends video cards with the video field instead of image', async () => {
+      const videoCards = [{ ...cards[0]!, mediaType: 'VIDEO' as const, buttons: [] }, { ...cards[1]!, buttons: [] }];
+
+      await service.sendBaileyCarousel('sess-1', '+15551234567', 'Intro', 1, videoCards, 0);
+
+      const jid = '15551234567@s.whatsapp.net';
+      expect(sock.sendMessage).toHaveBeenNthCalledWith(2, jid, { video: Buffer.from('fake-bytes'), caption: 'Card A' });
+    });
+
+    it('does nothing (no socket calls) in DRY_RUN mode', async () => {
+      (service as unknown as { dryRun: boolean }).dryRun = true;
+      await service.sendBaileyCarousel('sess-1', '+15551234567', 'Intro', 1, cards, 0);
+      expect(sock.sendMessage).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleInboundMessage button matching', () => {
     const buttons = [
       { id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' },
@@ -490,6 +560,44 @@ describe('SessionsService', () => {
           buttonId: undefined,
           buttonLabel: undefined,
         },
+      });
+    });
+  });
+
+  describe('handleInboundMessage carousel button matching', () => {
+    // Carousel-mode templates store buttons per-card (Template.buttons is null) — matching
+    // must flatten across cards. ButtonDef.id is globally unique, so no card-scoping needed.
+    const carouselCards = [
+      { id: 'card1', mediaUrl: 'http://x/a.jpg', body: 'Card A', buttons: [{ id: 'yes-1', type: 'QUICK_REPLY' as const, label: 'Yes' }] },
+      { id: 'card2', mediaUrl: 'http://x/b.jpg', body: 'Card B', buttons: [{ id: 'no-1', type: 'QUICK_REPLY' as const, label: 'No' }] },
+    ];
+
+    beforeEach(() => {
+      (prisma.contact.findUnique as jest.Mock).mockResolvedValue({ id: 'contact-1', phone: '+15551234567' });
+      (prisma.campaignMessage.findFirst as jest.Mock).mockResolvedValue({
+        id: 'msg-1',
+        campaignId: 'camp-1',
+        campaign: { template: { buttons: null, carouselCards } },
+      });
+    });
+
+    const callHandleInbound = (text: string, nativeButtonId?: string) =>
+      (service as unknown as { handleInboundMessage: (s: string, p: string, t: string, n?: string) => Promise<void> })
+        .handleInboundMessage('sess-1', '+15551234567', text, nativeButtonId);
+
+    it('matches a numeral against the flattened card2 button (global position 2)', async () => {
+      await callHandleInbound('2');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'camp-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No' },
+      });
+    });
+
+    it('matches a native button-response id from a non-first card', async () => {
+      await callHandleInbound('ignored raw text', 'no-1');
+
+      expect(prisma.reply.create).toHaveBeenCalledWith({
+        data: { contactId: 'contact-1', campaignId: 'camp-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No' },
       });
     });
   });

@@ -174,6 +174,9 @@ export class CloudApiWorker extends WorkerHost {
           ? { type: job.data.mediaType, url: job.data.mediaUrl, filename: job.data.mediaFilename }
           : undefined,
         buttons: job.data.buttons,
+        carousel: job.data.carouselCards?.length
+          ? { cards: job.data.carouselCards, assetIds: job.data.carouselCardAssetIds ?? [] }
+          : undefined,
       });
 
       await this.prisma.campaignMessage.update({
