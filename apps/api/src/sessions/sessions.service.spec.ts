@@ -1,6 +1,6 @@
 import { Test, type TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { SessionMode, SessionStatus } from '@prisma/client';
+import { Prisma, SessionMode, SessionStatus } from '@prisma/client';
 import { SessionsService } from './sessions.service';
 import { SessionsGateway } from './sessions.gateway';
 import { PrismaService } from '../common/prisma/prisma.service';
@@ -297,6 +297,68 @@ describe('SessionsService', () => {
       const makeWASocketMock = makeWASocket as jest.Mock;
       const callArgs = makeWASocketMock.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
       expect(callArgs?.fetchAgent).toBeUndefined();
+    });
+  });
+
+  // ── loggedOut (401) self-healing ──────────────────────────────────────────────
+  // Regression test for: "Reconnect" hanging forever on a session whose stored
+  // credentials WhatsApp has permanently invalidated — see handleConnectionUpdate's
+  // loggedOut branch. Without clearing authState, every reconnect attempt reloads the
+  // same dead creds, gets the same 401, and never reaches the "needs QR" state.
+  describe('handleConnectionUpdate loggedOut', () => {
+    it('clears the stale authState and immediately starts a fresh pairing attempt', async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      (prisma.session.update as jest.Mock).mockResolvedValue(mockSession);
+
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      const sock = makeWASocketMock.mock.results[makeWASocketMock.mock.results.length - 1]!.value;
+      const onCalls = (sock.ev.on as jest.Mock).mock.calls as Array<[string, (update: unknown) => void]>;
+      const connectionUpdateHandler = onCalls.find(([event]) => event === 'connection.update')?.[1];
+      expect(connectionUpdateHandler).toBeDefined();
+
+      (prisma.session.update as jest.Mock).mockClear();
+      makeWASocketMock.mockClear();
+
+      connectionUpdateHandler!({ connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } });
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      expect(prisma.session.update).toHaveBeenCalledWith({
+        where: { id: 'sess-1' },
+        data: { authState: Prisma.JsonNull },
+      });
+      // A brand-new connection attempt (fresh, unregistered creds) was kicked off
+      // immediately — an operator watching the Reconnect modal gets a QR without
+      // needing to click again.
+      expect(makeWASocketMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('marks the session OFFLINE and pauses its campaigns', async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      (prisma.session.update as jest.Mock).mockResolvedValue(mockSession);
+      (prisma.campaignMessage.findMany as jest.Mock).mockResolvedValue([{ campaignId: 'camp-1' }]);
+      (prisma.campaign.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      const sock = makeWASocketMock.mock.results[makeWASocketMock.mock.results.length - 1]!.value;
+      const onCalls = (sock.ev.on as jest.Mock).mock.calls as Array<[string, (update: unknown) => void]>;
+      const connectionUpdateHandler = onCalls.find(([event]) => event === 'connection.update')?.[1];
+
+      connectionUpdateHandler!({ connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } });
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      expect(gateway.emitStatus).toHaveBeenCalledWith('sess-1', SessionStatus.OFFLINE);
+      expect(prisma.campaign.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['camp-1'] }, status: 'RUNNING' },
+        data: { status: 'PAUSED' },
+      });
     });
   });
 

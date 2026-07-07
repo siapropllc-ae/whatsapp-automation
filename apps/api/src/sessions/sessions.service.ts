@@ -7,7 +7,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { type Prisma, type Session, CampaignStatus, MediaType, MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
+import { Prisma, type Session, CampaignStatus, MediaType, MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -621,7 +621,22 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         await this.proxy.releaseProxy(sessionId);
         this.sockets.delete(sessionId);
         this.reconnectDelays.delete(sessionId);
+        // A loggedOut/401 means WhatsApp has permanently invalidated these credentials —
+        // resuming with them will always fail the same way. Clear them so the stored auth
+        // state resets to unregistered; without this, every future "Reconnect" click would
+        // keep loading the same dead creds, hit this exact branch again, and never reach
+        // the "needs pairing" state that actually emits a QR code.
+        await this.prisma.session
+          .update({ where: { id: sessionId }, data: { authState: Prisma.JsonNull } })
+          .catch((err: unknown) => this.log.error(`clearing stale authState failed [${sessionId}]: ${String(err)}`));
         await this.pauseCampaignsForSession(sessionId);
+        // Immediately start a fresh pairing attempt with the now-cleared credentials, so an
+        // operator who clicked "Reconnect" (and is watching for a QR right now) gets one
+        // without needing to click again — this is a genuinely new, unregistered connection
+        // attempt, not a retry of the one that just failed.
+        void this.startSocket(sessionId).catch((err: unknown) =>
+          this.log.error(`fresh-pairing startSocket failed [${sessionId}]: ${String(err)}`),
+        );
         return;
       }
 
