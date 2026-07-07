@@ -1,33 +1,18 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import { DashLayout } from '@/components/DashLayout';
 import { Badge } from '@/components/Badge';
 import { Button } from '@/components/Button';
-import { Modal } from '@/components/Modal';
 import { EmptyState } from '@/components/EmptyState';
 import { CardSkeleton } from '@/components/Skeleton';
 import { useToast, ToastProvider } from '@/components/Toast';
 import { apiFetch } from '@/lib/api';
-import { spinText, validateCarousel } from '@wa-engine/shared';
-import type { Template, ButtonDef, CarouselCardDef } from '@/types/api';
+import { spinText } from '@wa-engine/shared';
+import type { Template } from '@/types/api';
 import { RE_TEMPLATES, RE_CATEGORIES } from '@/data/re-templates';
-import { ButtonPreview } from '@/components/ButtonPreview';
-import { ButtonListEditor } from '@/components/ButtonListEditor';
-import { CarouselCardEditor } from '@/components/CarouselCardEditor';
-import { CarouselPreview } from '@/components/CarouselPreview';
-
-const MAX_BUTTONS = 3;
-const MIN_CARDS = 2;
-const MAX_CARDS = 10;
-
-function newCarouselCard(): CarouselCardDef {
-  return { id: crypto.randomUUID(), mediaUrl: '', body: '', buttons: [] };
-}
-
-const CATEGORIES = ['marketing', 'utility', 'auth', 'service'] as const;
-type Category = (typeof CATEGORIES)[number];
 
 /* ── SVG Icons ─────────────────────────────────────────────────── */
 const IcTrash = () => (
@@ -87,7 +72,7 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function TemplateCard({ template: t, onEdit, onDelete }: { template: Template; onEdit: () => void; onDelete: () => void }) {
+function TemplateCard({ template: t, onEdit, onDuplicate, onDelete }: { template: Template; onEdit: () => void; onDuplicate: () => void; onDelete: () => void }) {
   const [spinPreview, setSpinPreview] = useState(spinText(t.body, { name: 'Demo', city: 'Karachi' }));
   // Template bodies are free text (operator-typed or AI-generated) — escape before
   // injecting via dangerouslySetInnerHTML, then highlight the {spin} markers.
@@ -120,6 +105,7 @@ function TemplateCard({ template: t, onEdit, onDelete }: { template: Template; o
       </div>
       <div style={{ display: 'flex', gap: 8, borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 14 }}>
         <button onClick={onEdit} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 7, color: 'var(--text-secondary)', cursor: 'pointer', padding: '7px 12px', fontSize: 12, fontFamily: 'inherit', transition: 'all 0.15s' }}><IcEdit />Edit</button>
+        <button onClick={onDuplicate} title="Duplicate template" style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 7, color: 'var(--text-secondary)', cursor: 'pointer', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}><IcCopy /></button>
         <button onClick={onDelete} style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.1)', borderRadius: 7, color: '#ef4444', cursor: 'pointer', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}><IcTrash /></button>
       </div>
     </div>
@@ -162,29 +148,23 @@ function LibraryCard({ tpl, onUse }: { tpl: typeof RE_TEMPLATES[number]; onUse: 
 }
 
 /* ── Shared styles ─────────────────────────────────────────────── */
-const labelStyle: React.CSSProperties = { display: 'block', fontSize: 11, fontWeight: 500, color: 'var(--text-muted)', marginBottom: 6, letterSpacing: '0.8px', textTransform: 'uppercase' };
 const inputStyle: React.CSSProperties = { width: '100%', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '10px 14px', color: 'var(--text-primary)', fontSize: 13, outline: 'none', fontFamily: 'inherit' };
+
+type TypeFilter = 'ALL' | 'SINGLE' | 'CAROUSEL';
 
 /* ── Main content ───────────────────────────────────────────────── */
 function TemplatesContent() {
+  const router = useRouter();
   const { data, isLoading, mutate } = useSWR<Template[]>('/templates', (url: string) => apiFetch<Template[]>(url));
   const { toast } = useToast();
 
   // Tab state
   const [activeTab, setActiveTab] = useState<'mine' | 'library'>('mine');
 
-  // My Templates modal state
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editTemplate, setEditTemplate] = useState<Template | null>(null);
-  const [mode, setMode] = useState<'SINGLE' | 'CAROUSEL'>('SINGLE');
-  const [name, setName] = useState('');
-  const [category, setCategory] = useState<Category>('marketing');
-  const [body, setBody] = useState('');
-  const [mediaUrl, setMediaUrl] = useState('');
-  const [buttons, setButtons] = useState<ButtonDef[]>([]);
-  const [carouselCards, setCarouselCards] = useState<CarouselCardDef[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [preview, setPreview] = useState('');
+  // My Templates filter state
+  const [mySearch, setMySearch] = useState('');
+  const [myCategory, setMyCategory] = useState<string>('All');
+  const [myType, setMyType] = useState<TypeFilter>('ALL');
 
   // Library filter state
   const [libSearch, setLibSearch] = useState('');
@@ -192,70 +172,46 @@ function TemplatesContent() {
   const [libPage, setLibPage] = useState(1);
   const LIB_PAGE_SIZE = 30;
 
-  React.useEffect(() => {
-    setPreview(body ? spinText(body, { name: 'Demo', city: 'Karachi', phone: '+923001234567' }) : '');
-  }, [body]);
+  const templates = useMemo(() => data ?? [], [data]);
 
-  const openModal = (t?: Template, prefill?: { name: string; body: string }) => {
-    if (t) {
-      setEditTemplate(t);
-      setMode(t.carouselCards?.length ? 'CAROUSEL' : 'SINGLE');
-      setName(t.name); setCategory((t.category as Category) ?? 'marketing'); setBody(t.body); setMediaUrl(t.mediaUrl ?? ''); setButtons(t.buttons ?? []);
-      setCarouselCards(t.carouselCards ?? []);
-    } else {
-      setEditTemplate(null);
-      setMode('SINGLE');
-      setName(prefill?.name ?? '');
-      setCategory('marketing');
-      setBody(prefill?.body ?? '');
-      setMediaUrl('');
-      setButtons([]);
-      setCarouselCards([]);
+  const filteredMine = useMemo(() => {
+    let list = templates;
+    if (myCategory !== 'All') list = list.filter((t) => (t.category ?? 'marketing') === myCategory);
+    if (myType !== 'ALL') list = list.filter((t) => (t.carouselCards?.length ? 'CAROUSEL' : 'SINGLE') === myType);
+    if (mySearch.trim()) {
+      const q = mySearch.toLowerCase();
+      list = list.filter((t) => t.name.toLowerCase().includes(q) || t.body.toLowerCase().includes(q));
     }
-    setModalOpen(true);
-  };
-
-  const addCard = () => {
-    if (carouselCards.length >= MAX_CARDS) return;
-    setCarouselCards([...carouselCards, newCarouselCard()]);
-  };
-  const updateCard = (index: number, patch: Partial<CarouselCardDef>) => {
-    setCarouselCards(carouselCards.map((c, i) => (i === index ? { ...c, ...patch } : c)));
-  };
-  const removeCard = (index: number) => {
-    setCarouselCards(carouselCards.filter((_, i) => i !== index));
-  };
-  const carouselCheck = useMemo(() => validateCarousel(carouselCards, 'ANY'), [carouselCards]);
-
-  const handleSave = async () => {
-    setSaving(true);
-    try {
-      // The backend's mutual-exclusivity logic keys off which of buttons/carouselCards
-      // is PRESENT in the request body (JSON.stringify drops undefined-valued keys, so
-      // this genuinely omits the other field rather than sending an empty array for
-      // it). The active mode's field is always sent, even empty, so "clear my buttons"
-      // still clears — an absent key would leave the other mode's stale data untouched.
-      const payload =
-        mode === 'CAROUSEL'
-          ? { name, category, body, carouselCards, buttons: undefined, mediaUrl: undefined }
-          : { name, category, body, mediaUrl: mediaUrl || undefined, buttons, carouselCards: undefined };
-      if (editTemplate) {
-        await apiFetch(`/templates/${editTemplate.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-      } else {
-        await apiFetch('/templates', { method: 'POST', body: JSON.stringify(payload) });
-      }
-      toast('Template saved', 'success');
-      setModalOpen(false);
-      mutate();
-    } catch (err) { toast(String(err), 'error'); }
-    finally { setSaving(false); }
-  };
+    return list;
+  }, [templates, mySearch, myCategory, myType]);
 
   const handleDelete = async (id: string) => {
     if (!confirm('Delete this template?')) return;
     try {
       await apiFetch(`/templates/${id}`, { method: 'DELETE' });
       toast('Template deleted', 'success');
+      mutate();
+    } catch (err) { toast(String(err), 'error'); }
+  };
+
+  const handleDuplicate = async (t: Template) => {
+    try {
+      const payload = t.carouselCards?.length
+        ? {
+            name: `${t.name} (Copy)`,
+            category: t.category ?? undefined,
+            body: t.body,
+            carouselCards: t.carouselCards.map((c) => ({ ...c, id: crypto.randomUUID() })),
+          }
+        : {
+            name: `${t.name} (Copy)`,
+            category: t.category ?? undefined,
+            body: t.body,
+            mediaUrl: t.mediaUrl ?? undefined,
+            buttons: (t.buttons ?? []).map((b) => ({ ...b, id: crypto.randomUUID() })),
+          };
+      await apiFetch('/templates', { method: 'POST', body: JSON.stringify(payload) });
+      toast('Template duplicated', 'success');
       mutate();
     } catch (err) { toast(String(err), 'error'); }
   };
@@ -276,8 +232,6 @@ function TemplatesContent() {
 
   React.useEffect(() => { setLibPage(1); }, [libSearch, libCategory]);
 
-  const templates = data ?? [];
-
   const tabStyle = (active: boolean): React.CSSProperties => ({
     display: 'flex', alignItems: 'center', gap: 7, padding: '8px 18px', borderRadius: 8, fontSize: 13, fontWeight: 500, cursor: 'pointer', border: 'none', fontFamily: 'inherit', transition: 'all 0.15s',
     background: active ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)',
@@ -285,11 +239,18 @@ function TemplatesContent() {
     outline: active ? '1px solid rgba(37,211,102,0.2)' : '1px solid rgba(255,255,255,0.06)',
   });
 
+  const typePillStyle = (active: boolean): React.CSSProperties => ({
+    padding: '7px 14px', borderRadius: 6, fontSize: 11, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit',
+    border: `1px solid ${active ? 'rgba(37,211,102,0.3)' : 'rgba(255,255,255,0.06)'}`,
+    background: active ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)',
+    color: active ? '#25d366' : 'var(--text-muted)',
+  });
+
   return (
     <DashLayout title="Templates" onRefresh={() => mutate()}>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 22 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 22, flexWrap: 'wrap', gap: 12 }}>
         <div style={{ display: 'flex', gap: 8 }}>
           <button style={tabStyle(activeTab === 'mine')} onClick={() => setActiveTab('mine')}>
             <IcFile />My Templates {templates.length > 0 && <span style={{ background: 'rgba(255,255,255,0.08)', borderRadius: 10, padding: '1px 7px', fontSize: 10 }}>{templates.length}</span>}
@@ -298,12 +259,39 @@ function TemplatesContent() {
             <IcBook />RE Library <span style={{ background: 'rgba(37,211,102,0.1)', borderRadius: 10, padding: '1px 7px', fontSize: 10, color: '#25d366' }}>{RE_TEMPLATES.length}</span>
           </button>
         </div>
-        {activeTab === 'mine' && <Button onClick={() => openModal()}>New Template</Button>}
+        {activeTab === 'mine' && <Button onClick={() => router.push('/templates/new')}>New Template</Button>}
       </div>
 
       {/* ── MY TEMPLATES TAB ── */}
       {activeTab === 'mine' && (
         <>
+          {templates.length > 0 && (
+            <div style={{ display: 'flex', gap: 10, marginBottom: 18, flexWrap: 'wrap', alignItems: 'center' }}>
+              <div style={{ position: 'relative', flex: '1 1 220px' }}>
+                <div style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', pointerEvents: 'none' }}><IcSearch /></div>
+                <input
+                  value={mySearch}
+                  onChange={(e) => setMySearch(e.target.value)}
+                  placeholder="Search your templates..."
+                  style={{ ...inputStyle, paddingLeft: 34 }}
+                />
+              </div>
+              <select
+                value={myCategory}
+                onChange={(e) => setMyCategory(e.target.value)}
+                style={{ ...inputStyle, width: 'auto', minWidth: 160, flex: '0 0 auto' }}
+              >
+                <option value="All">All Categories</option>
+                {['marketing', 'utility', 'auth', 'service'].map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button style={typePillStyle(myType === 'ALL')} onClick={() => setMyType('ALL')}>All</button>
+                <button style={typePillStyle(myType === 'SINGLE')} onClick={() => setMyType('SINGLE')}>Single</button>
+                <button style={typePillStyle(myType === 'CAROUSEL')} onClick={() => setMyType('CAROUSEL')}>🎠 Carousel</button>
+              </div>
+            </div>
+          )}
+
           {isLoading ? (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
               {[1, 2, 3, 4].map((i) => <CardSkeleton key={i} />)}
@@ -315,16 +303,23 @@ function TemplatesContent() {
               subtitle="Create your own templates below, or browse the Real Estate Library to get started instantly"
               action={
                 <div style={{ display: 'flex', gap: 10 }}>
-                  <Button onClick={() => openModal()}>New Template</Button>
+                  <Button onClick={() => router.push('/templates/new')}>New Template</Button>
                   <Button variant="outline" onClick={() => setActiveTab('library')}>Browse RE Library</Button>
                 </div>
               }
             />
+          ) : filteredMine.length === 0 ? (
+            <EmptyState icon={<IcSearch />} title="No templates found" subtitle="Try a different search term or filter" />
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 }}>
-              {templates.map((t, i) => (
+              {filteredMine.map((t, i) => (
                 <div key={t.id} className={`anim-${Math.min(i + 1, 6) as 1 | 2 | 3 | 4 | 5 | 6}`}>
-                  <TemplateCard template={t} onEdit={() => openModal(t)} onDelete={() => handleDelete(t.id)} />
+                  <TemplateCard
+                    template={t}
+                    onEdit={() => router.push(`/templates/${t.id}/edit`)}
+                    onDuplicate={() => handleDuplicate(t)}
+                    onDelete={() => handleDelete(t.id)}
+                  />
                 </div>
               ))}
             </div>
@@ -379,10 +374,7 @@ function TemplatesContent() {
                 <div key={tpl.id} className={`anim-${Math.min(i + 1, 6) as 1 | 2 | 3 | 4 | 5 | 6}`}>
                   <LibraryCard
                     tpl={tpl}
-                    onUse={() => {
-                      openModal(undefined, { name: tpl.name, body: tpl.body });
-                      setActiveTab('mine');
-                    }}
+                    onUse={() => router.push(`/templates/new?from=${tpl.id}`)}
                   />
                 </div>
               ))}
@@ -404,102 +396,6 @@ function TemplatesContent() {
           )}
         </div>
       )}
-
-      {/* Create / Edit Modal */}
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editTemplate ? 'Edit Template' : 'New Template'} width={700}>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
-          <button
-            onClick={() => setMode('SINGLE')}
-            style={{ flex: 1, padding: '8px 14px', borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', border: `1px solid ${mode === 'SINGLE' ? 'rgba(37,211,102,0.3)' : 'rgba(255,255,255,0.06)'}`, background: mode === 'SINGLE' ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)', color: mode === 'SINGLE' ? '#25d366' : 'var(--text-muted)' }}
-          >
-            Single Message
-          </button>
-          <button
-            onClick={() => setMode('CAROUSEL')}
-            style={{ flex: 1, padding: '8px 14px', borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', border: `1px solid ${mode === 'CAROUSEL' ? 'rgba(37,211,102,0.3)' : 'rgba(255,255,255,0.06)'}`, background: mode === 'CAROUSEL' ? 'rgba(37,211,102,0.12)' : 'rgba(255,255,255,0.04)', color: mode === 'CAROUSEL' ? '#25d366' : 'var(--text-muted)' }}
-          >
-            🎠 Carousel (2-10 cards)
-          </button>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 22 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <div>
-              <label style={labelStyle}>Template name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Welcome Message" style={inputStyle} />
-            </div>
-            <div>
-              <label style={labelStyle}>Category</label>
-              <select value={category} onChange={(e) => setCategory(e.target.value as Category)} style={{ ...inputStyle, fontFamily: 'inherit' }}>
-                {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-            <div>
-              <label style={labelStyle}>{mode === 'CAROUSEL' ? 'Intro text (shared across all cards)' : 'Message body'}</label>
-              <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={mode === 'CAROUSEL' ? 3 : 7} placeholder="{Hi|Hello} {name}! Check out our offer..." style={{ ...inputStyle, height: 'auto', resize: 'vertical' as const, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }} />
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.6 }}>
-                <span style={{ color: '#25d366' }}>{'{opt1|opt2}'}</span> spin · <span style={{ color: '#25d366' }}>{'{name}'} {'{city}'}</span> vars
-              </div>
-            </div>
-
-            {mode === 'SINGLE' ? (
-              <>
-                <div>
-                  <label style={labelStyle}>Media URL (optional)</label>
-                  <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)} placeholder="https://..." style={inputStyle} />
-                </div>
-                <ButtonListEditor buttons={buttons} onChange={setButtons} maxButtons={MAX_BUTTONS} showCloudApiWarning />
-              </>
-            ) : (
-              <div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <label style={{ ...labelStyle, marginBottom: 0 }}>Cards ({carouselCards.length}/{MAX_CARDS})</label>
-                  <button
-                    onClick={addCard}
-                    disabled={carouselCards.length >= MAX_CARDS}
-                    style={{ background: 'rgba(37,211,102,0.1)', border: '1px solid rgba(37,211,102,0.2)', borderRadius: 6, color: '#25d366', cursor: carouselCards.length >= MAX_CARDS ? 'not-allowed' : 'pointer', opacity: carouselCards.length >= MAX_CARDS ? 0.4 : 1, fontSize: 11, padding: '4px 10px' }}
-                  >
-                    + Add card
-                  </button>
-                </div>
-                {carouselCards.map((card, i) => (
-                  <CarouselCardEditor key={card.id} card={card} index={i} onChange={(patch) => updateCard(i, patch)} onRemove={() => removeCard(i)} />
-                ))}
-                {carouselCards.length < MIN_CARDS && (
-                  <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 4 }}>
-                    A carousel needs at least {MIN_CARDS} cards.
-                  </div>
-                )}
-                {!!carouselCards.length && !carouselCheck.valid && (
-                  <div style={{ fontSize: 11, color: '#f59e0b', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)', borderRadius: 8, padding: '8px 10px', marginTop: 4, lineHeight: 1.5 }}>
-                    ⚠ {carouselCheck.errors.join(' ')}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-          <div>
-            <label style={labelStyle}>Live Preview</label>
-            <div style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 12, padding: 16, minHeight: 200, fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
-              {preview || <span style={{ color: 'var(--text-muted)' }}>Preview will appear as you type...</span>}
-              {mode === 'SINGLE' ? <ButtonPreview buttons={buttons} /> : <CarouselPreview cards={carouselCards} />}
-            </div>
-            <div style={{ marginTop: 10, background: 'rgba(37,211,102,0.05)', border: '1px solid rgba(37,211,102,0.1)', borderRadius: 8, padding: '8px 12px' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>Rendered with</div>
-              <div style={{ fontSize: 11, color: '#25d366' }}>name=Demo · city=Karachi · phone=+923...</div>
-            </div>
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 22, paddingTop: 18, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-          <Button variant="outline" onClick={() => setModalOpen(false)}>Cancel</Button>
-          <Button
-            loading={saving}
-            onClick={handleSave}
-            disabled={!name || !body || (mode === 'CAROUSEL' && !carouselCheck.valid)}
-          >
-            Save Template
-          </Button>
-        </div>
-      </Modal>
     </DashLayout>
   );
 }

@@ -168,6 +168,23 @@ body::before {
   backdrop-filter: blur(12px) !important;
 }
 
+/* ── Template editor split-panel workspace ────────────── */
+.template-editor-grid {
+  grid-template-columns: minmax(0, 1fr) 420px;
+}
+.template-editor-preview {
+  position: sticky;
+  top: 24px;
+}
+@media (max-width: 900px) {
+  .template-editor-grid {
+    grid-template-columns: 1fr;
+  }
+  .template-editor-preview {
+    position: static;
+  }
+}
+
 /* ── Card hover ────────────────────────────────────── */
 .glass-card-hover {
   transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;

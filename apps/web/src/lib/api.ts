@@ -1,3 +1,20 @@
+export interface SavedMedia {
+  url: string;
+  type: 'IMAGE' | 'DOCUMENT' | 'VIDEO';
+  mimeType: string;
+  filename: string;
+  size: number;
+}
+
+/** Uploads a file to the media endpoint. Shared by MediaDropzone and the campaign wizard's attachment picker. */
+export async function uploadMedia(file: File): Promise<SavedMedia> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch('/api/media/upload', { method: 'POST', body: form });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<SavedMedia>;
+}
+
 /** Base fetch helper — routes through /api/* Next.js proxy */
 export async function apiFetch<T = unknown>(
   path: string,

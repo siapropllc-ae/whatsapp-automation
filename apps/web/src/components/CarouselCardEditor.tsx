@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { useToast } from '@/components/Toast';
+import React from 'react';
 import { ButtonListEditor } from '@/components/ButtonListEditor';
+import { MediaDropzone } from '@/components/MediaDropzone';
 import type { CarouselCardDef } from '@/types/api';
 
 const MAX_BUTTONS_PER_CARD = 2;
@@ -14,14 +14,11 @@ const IcTrash = () => (
     <path d="M10 11v6" /><path d="M14 11v6" />
   </svg>
 );
-const IcPaperclip = () => (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-  </svg>
-);
-const IcX = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+const IcGrip = () => (
+  <svg width="12" height="16" viewBox="0 0 12 16" fill="currentColor">
+    <circle cx="3" cy="2.5" r="1.4" /><circle cx="9" cy="2.5" r="1.4" />
+    <circle cx="3" cy="8" r="1.4" /><circle cx="9" cy="8" r="1.4" />
+    <circle cx="3" cy="13.5" r="1.4" /><circle cx="9" cy="13.5" r="1.4" />
   </svg>
 );
 
@@ -30,59 +27,37 @@ interface CarouselCardEditorProps {
   index: number;
   onChange: (patch: Partial<CarouselCardDef>) => void;
   onRemove: () => void;
+  /** Drag events wired up by the parent list (which owns reorder state) — only this
+   * handle initiates a drag, never the card body, so text inputs/textareas inside the
+   * card keep normal text-selection behavior. */
+  dragHandleProps?: React.HTMLAttributes<HTMLSpanElement>;
 }
 
 /** One card's editor within a carousel Template: image/video upload, body text, and
  * up to 2 buttons (mixed types allowed — Meta's carousel rule, unlike single-card mode). */
-export function CarouselCardEditor({ card, index, onChange, onRemove }: CarouselCardEditorProps) {
-  const { toast } = useToast();
-  const [uploading, setUploading] = useState(false);
-
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch('/api/media/upload', { method: 'POST', body: form });
-      if (!res.ok) throw new Error(await res.text());
-      const data = (await res.json()) as { url: string; type: string; filename: string };
-      onChange({ mediaUrl: data.url, mediaType: data.type === 'VIDEO' ? 'VIDEO' : 'IMAGE' });
-    } catch (err) {
-      toast(`Upload failed: ${String(err)}`, 'error');
-    } finally {
-      setUploading(false);
-      e.target.value = '';
-    }
-  };
-
+export function CarouselCardEditor({ card, index, onChange, onRemove, dragHandleProps }: CarouselCardEditorProps) {
   return (
     <div style={{ border: '1px solid rgba(255,255,255,0.07)', borderRadius: 10, padding: 14, marginBottom: 10, background: 'rgba(255,255,255,0.015)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>Card {index + 1}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {dragHandleProps && (
+            <span {...dragHandleProps} style={{ cursor: 'grab', color: 'var(--text-muted)', display: 'flex', ...dragHandleProps.style }} title="Drag to reorder">
+              <IcGrip />
+            </span>
+          )}
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>Card {index + 1}</div>
+        </div>
         <button onClick={onRemove} style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.1)', borderRadius: 7, color: '#ef4444', cursor: 'pointer', width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><IcTrash /></button>
       </div>
 
       <div style={{ marginBottom: 10 }}>
-        <label style={labelStyle}>Image / Video</label>
-        {card.mediaUrl ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(37,211,102,0.05)', border: '1px solid rgba(37,211,102,0.15)', borderRadius: 8, padding: '8px 10px' }}>
-            {card.mediaType === 'VIDEO' ? (
-              <div style={{ width: 36, height: 36, borderRadius: 6, background: 'rgba(37,211,102,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, color: '#25d366' }}><IcPaperclip /></div>
-            ) : (
-              <img src={card.mediaUrl} alt={`Card ${index + 1}`} style={{ width: 36, height: 36, objectFit: 'cover', borderRadius: 6, flexShrink: 0 }} />
-            )}
-            <div style={{ flex: 1, fontSize: 11, color: 'var(--text-muted)' }}>{card.mediaType ?? 'IMAGE'} attached</div>
-            <button onClick={() => onChange({ mediaUrl: '', mediaType: undefined })} style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 6, padding: '4px 8px', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}><IcX /></button>
-          </div>
-        ) : (
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.02)', border: '1px dashed rgba(255,255,255,0.1)', borderRadius: 8, cursor: uploading ? 'wait' : 'pointer', color: 'var(--text-muted)', fontSize: 12 }}>
-            <IcPaperclip />
-            {uploading ? 'Uploading…' : 'Attach image or video'}
-            <input type="file" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/3gpp" style={{ display: 'none' }} disabled={uploading} onChange={handleUpload} />
-          </label>
-        )}
+        <MediaDropzone
+          value={card.mediaUrl ? { url: card.mediaUrl, type: card.mediaType } : null}
+          onChange={(media) => onChange({ mediaUrl: media?.url ?? '', mediaType: media?.type === 'VIDEO' ? 'VIDEO' : media ? 'IMAGE' : undefined })}
+          allowDocument={false}
+          compact
+          label="Image / Video"
+        />
       </div>
 
       <div style={{ marginBottom: 10 }}>
