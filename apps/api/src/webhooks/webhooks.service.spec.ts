@@ -1,8 +1,9 @@
 import { Test, type TestingModule } from '@nestjs/testing';
-import { MsgStatus } from '@prisma/client';
+import { MsgStatus, SessionMode } from '@prisma/client';
 import { WebhooksService } from './webhooks.service';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionsGateway } from '../sessions/sessions.gateway';
+import { SessionsService } from '../sessions/sessions.service';
 import type { MetaWebhookPayload } from './types/cloud-api-webhook.types';
 
 const mockPrisma = {
@@ -18,12 +19,22 @@ const mockPrisma = {
   },
   reply: {
     create: jest.fn(),
+    findUnique: jest.fn().mockResolvedValue(null), // not a duplicate by default
+  },
+  session: {
+    findMany: jest.fn().mockResolvedValue([]),
+    update: jest.fn().mockResolvedValue({}),
   },
 };
 
 const mockGateway = {
   emitCampaignStats: jest.fn(),
   emitReply: jest.fn(),
+  emitStatus: jest.fn(),
+};
+
+const mockSessions = {
+  pauseCampaignsForSession: jest.fn().mockResolvedValue(0),
 };
 
 function makeStatusPayload(
@@ -103,6 +114,7 @@ describe('WebhooksService', () => {
         WebhooksService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: SessionsGateway, useValue: mockGateway },
+        { provide: SessionsService, useValue: mockSessions },
       ],
     }).compile();
     service = module.get<WebhooksService>(WebhooksService);
@@ -160,6 +172,7 @@ describe('WebhooksService', () => {
           contactId: 'contact-1',
           campaignId: 'campaign-1',
           text: 'Hello!',
+          waMessageId: 'wamid.inbound123',
         },
       });
     });
@@ -232,7 +245,7 @@ describe('WebhooksService', () => {
       await service.processCloudApiPayload(payload);
 
       expect(mockPrisma.reply.create).toHaveBeenCalledWith({
-        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Yes', buttonId: 'yes-1', buttonLabel: 'Yes' },
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Yes', buttonId: 'yes-1', buttonLabel: 'Yes', waMessageId: 'wamid.btn1' },
       });
     });
 
@@ -276,7 +289,7 @@ describe('WebhooksService', () => {
       await service.processCloudApiPayload(payload);
 
       expect(mockPrisma.reply.create).toHaveBeenCalledWith({
-        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No' },
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'No', buttonId: 'no-1', buttonLabel: 'No', waMessageId: 'wamid.interactive1' },
       });
     });
 
@@ -324,7 +337,7 @@ describe('WebhooksService', () => {
       await service.processCloudApiPayload(payload);
 
       expect(mockPrisma.reply.create).toHaveBeenCalledWith({
-        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Book Now', buttonId: 'card2-btn-1', buttonLabel: 'Book Now' },
+        data: { contactId: 'contact-1', campaignId: 'campaign-1', text: 'Book Now', buttonId: 'card2-btn-1', buttonLabel: 'Book Now', waMessageId: 'wamid.carousel-card2-btn' },
       });
     });
 
@@ -416,5 +429,169 @@ describe('WebhooksService', () => {
       );
       expect(mockPrisma.contact.update).not.toHaveBeenCalled();
     });
+  });
+
+  // Regression test for: Meta's webhook delivery is documented at-least-once — a
+  // redelivered notification for a message already processed must not create a second
+  // Reply row (inflates reply counts, duplicates rows in the Replies UI).
+  describe('Inbound message idempotency', () => {
+    beforeEach(() => {
+      mockPrisma.contact.findUnique.mockResolvedValue({ id: 'contact-1', phone: '15551234567' });
+      mockPrisma.campaignMessage.findFirst.mockResolvedValue(null);
+      mockPrisma.reply.create.mockResolvedValue({});
+    });
+
+    it('skips creating a second Reply when the same wamid is redelivered', async () => {
+      mockPrisma.reply.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'reply-1' });
+
+      const payload = makeInboundPayload('15551234567', 'Hello!');
+      await service.processCloudApiPayload(payload);
+      await service.processCloudApiPayload(payload); // redelivery of the exact same webhook
+
+      expect(mockPrisma.reply.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('swallows a P2002 unique-constraint race as an already-processed duplicate', async () => {
+      mockPrisma.reply.create.mockRejectedValueOnce({ code: 'P2002' });
+
+      await expect(
+        service.processCloudApiPayload(makeInboundPayload('15551234567', 'Hello!')),
+      ).resolves.not.toThrow();
+    });
+  });
+
+  // Cloud API's only ban/restriction signal — there's no persistent connection to drop
+  // the way Baileys detects a ban via disconnect codes.
+  describe('account_update (Gap 1: Cloud API ban detection)', () => {
+    function makeAccountUpdatePayload(value: Record<string, unknown>): MetaWebhookPayload {
+      return {
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'WABA_ID', changes: [{ field: 'account_update', value } as never] }],
+      };
+    }
+
+    it('marks the session BANNED and pauses its campaigns on DISABLED_UPDATE', async () => {
+      mockPrisma.session.findMany.mockResolvedValueOnce([
+        { id: 'sess-1', mode: SessionMode.CLOUD_API, cloudApi: { wabaId: 'WABA_ID', phoneNumberId: '123' } },
+      ]);
+
+      await service.processCloudApiPayload(
+        makeAccountUpdatePayload({ event: 'DISABLED_UPDATE', ban_info: { waba_ban_state: 'DISABLE' } }),
+      );
+
+      expect(mockPrisma.session.update).toHaveBeenCalledWith({
+        where: { id: 'sess-1' },
+        data: { status: 'BANNED' },
+      });
+      expect(mockSessions.pauseCampaignsForSession).toHaveBeenCalledWith('sess-1');
+    });
+
+    it('pauses campaigns (without marking BANNED) on ACCOUNT_RESTRICTION', async () => {
+      mockPrisma.session.findMany.mockResolvedValueOnce([
+        { id: 'sess-1', mode: SessionMode.CLOUD_API, cloudApi: { wabaId: 'WABA_ID', phoneNumberId: '123' } },
+      ]);
+
+      await service.processCloudApiPayload(
+        makeAccountUpdatePayload({ event: 'ACCOUNT_RESTRICTION', restriction_info: [{ restriction_type: 'RESTRICTED_BIZ_INITIATED_MESSAGING' }] }),
+      );
+
+      expect(mockPrisma.session.update).not.toHaveBeenCalled();
+      expect(mockSessions.pauseCampaignsForSession).toHaveBeenCalledWith('sess-1');
+    });
+
+    it('ignores account_update events that are not a ban/restriction signal', async () => {
+      mockPrisma.session.findMany.mockResolvedValueOnce([
+        { id: 'sess-1', mode: SessionMode.CLOUD_API, cloudApi: { wabaId: 'WABA_ID', phoneNumberId: '123' } },
+      ]);
+
+      await service.processCloudApiPayload(makeAccountUpdatePayload({ event: 'SOME_OTHER_EVENT' }));
+
+      expect(mockSessions.pauseCampaignsForSession).not.toHaveBeenCalled();
+    });
+
+    it('only pauses sessions matching the WABA id in cloudApi JSON, not other CLOUD_API sessions', async () => {
+      mockPrisma.session.findMany.mockResolvedValueOnce([
+        { id: 'sess-other-waba', mode: SessionMode.CLOUD_API, cloudApi: { wabaId: 'DIFFERENT_WABA' } },
+      ]);
+
+      await service.processCloudApiPayload(
+        makeAccountUpdatePayload({ event: 'DISABLED_UPDATE', ban_info: { waba_ban_state: 'DISABLE' } }),
+      );
+
+      expect(mockSessions.pauseCampaignsForSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('account_review_update', () => {
+    it('pauses campaigns for a REJECTED WABA review', async () => {
+      mockPrisma.session.findMany.mockResolvedValueOnce([
+        { id: 'sess-1', mode: SessionMode.CLOUD_API, cloudApi: { wabaId: 'WABA_ID' } },
+      ]);
+
+      await service.processCloudApiPayload({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'WABA_ID', changes: [{ field: 'account_review_update', value: { decision: 'REJECTED' } } as never] }],
+      });
+
+      expect(mockSessions.pauseCampaignsForSession).toHaveBeenCalledWith('sess-1');
+    });
+
+    it('takes no action for APPROVED', async () => {
+      await service.processCloudApiPayload({
+        object: 'whatsapp_business_account',
+        entry: [{ id: 'WABA_ID', changes: [{ field: 'account_review_update', value: { decision: 'APPROVED' } } as never] }],
+      });
+
+      expect(mockSessions.pauseCampaignsForSession).not.toHaveBeenCalled();
+      expect(mockPrisma.session.findMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('phone_number_quality_update', () => {
+    it('logs a warning on a tier demotion (does not pause — sending still works, just slower)', async () => {
+      const service_ = service as unknown as { log: { warn: jest.Mock } };
+      const warnSpy = jest.spyOn(service_.log, 'warn');
+
+      await service.processCloudApiPayload({
+        object: 'whatsapp_business_account',
+        entry: [{
+          id: 'WABA_ID',
+          changes: [{
+            field: 'phone_number_quality_update',
+            value: { display_phone_number: '15551234567', event: 'DOWNGRADE', old_limit: 'TIER_10K', current_limit: 'TIER_250' },
+          } as never],
+        }],
+      });
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('DEMOTION'));
+      expect(mockSessions.pauseCampaignsForSession).not.toHaveBeenCalled();
+    });
+
+    it('does not warn on a tier upgrade', async () => {
+      const service_ = service as unknown as { log: { warn: jest.Mock } };
+      const warnSpy = jest.spyOn(service_.log, 'warn');
+
+      await service.processCloudApiPayload({
+        object: 'whatsapp_business_account',
+        entry: [{
+          id: 'WABA_ID',
+          changes: [{
+            field: 'phone_number_quality_update',
+            value: { display_phone_number: '15551234567', event: 'UPGRADE', old_limit: 'TIER_250', current_limit: 'TIER_10K' },
+          } as never],
+        }],
+      });
+
+      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('DEMOTION'));
+    });
+  });
+
+  it('logs unhandled webhook fields instead of silently dropping them', async () => {
+    const debugSpy = jest.spyOn(service['log'], 'debug');
+    await service.processCloudApiPayload({
+      object: 'whatsapp_business_account',
+      entry: [{ id: 'WABA_ID', changes: [{ field: 'message_template_status_update', value: {} } as never] }],
+    });
+    expect(debugSpy).toHaveBeenCalledWith(expect.stringContaining('message_template_status_update'));
   });
 });

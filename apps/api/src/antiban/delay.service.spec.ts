@@ -182,6 +182,67 @@ describe('DelayService', () => {
     });
   });
 
+  // ── malformed .env fallback (NaN guard regression) ─────────────────────────
+  // A malformed env value must fall back to the hardcoded default, not become NaN —
+  // NaN would silently disable the minimum-gap anti-ban gate (`elapsed < NaN` is
+  // always false) instead of throwing something an operator would notice.
+
+  describe('malformed .env fallback', () => {
+    it('falls back to the hardcoded default for a non-numeric DELAY_MEAN_MS', async () => {
+      const badConfig = {
+        get: (key: string): string | undefined => (key === 'DELAY_MEAN_MS' ? 'not-a-number' : undefined),
+      } as unknown as ConfigService;
+      const module = await Test.createTestingModule({
+        providers: [
+          DelayService,
+          { provide: ConfigService, useValue: badConfig },
+          { provide: SettingsService, useValue: mockSettingsService },
+        ],
+      }).compile();
+      const badService = module.get(DelayService);
+
+      expect(badService.meanMs).toBe(120_000);
+      expect(Number.isFinite(badService.computeDelayMs())).toBe(true);
+    });
+
+    it('falls back to the hardcoded default for a negative DELAY_FLOOR_MS', async () => {
+      const badConfig = {
+        get: (key: string): string | undefined => (key === 'DELAY_FLOOR_MS' ? '-1000' : undefined),
+      } as unknown as ConfigService;
+      const module = await Test.createTestingModule({
+        providers: [
+          DelayService,
+          { provide: ConfigService, useValue: badConfig },
+          { provide: SettingsService, useValue: mockSettingsService },
+        ],
+      }).compile();
+      const badService = module.get(DelayService);
+
+      expect(badService.floorMs).toBe(60_000);
+    });
+  });
+
+  // ── contactMultiplier ───────────────────────────────────────────────────────
+  // Single source of truth for the cold-outreach tiered multiplier — both worker gates
+  // and campaign-launch scheduling must derive it from here (see delay.service.ts's
+  // doc comment on this method for why a drift here is a real, if low-severity, bug).
+
+  describe('contactMultiplier', () => {
+    it('is 2.5× for a true stranger (0 prior sent messages)', () => {
+      expect(service.contactMultiplier(0)).toBe(2.5);
+    });
+
+    it('is 1.8× for a contact with exactly 1 prior sent message', () => {
+      expect(service.contactMultiplier(1)).toBe(1.8);
+    });
+
+    it('is 1.0× (no penalty) from the 3rd prior sent message onward', () => {
+      expect(service.contactMultiplier(2)).toBe(1.0);
+      expect(service.contactMultiplier(3)).toBe(1.0);
+      expect(service.contactMultiplier(50)).toBe(1.0);
+    });
+  });
+
   // ── hourly bucket helpers ────────────────────────────────────────────────────
 
   describe('utcHourStamp / msUntilNextHour', () => {

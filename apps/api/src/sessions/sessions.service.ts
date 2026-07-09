@@ -22,6 +22,7 @@ import { FingerprintService } from '../antiban/fingerprint.service';
 import { ProxyService } from '../antiban/proxy.service';
 import { ContactsService } from '../contacts/contacts.service';
 import { MediaService } from '../media/media.service';
+import { SettingsService } from '../settings/settings.service';
 import { makeDbAuthState } from './baileys/db-auth-state';
 import { deriveKey } from './baileys/auth-cipher';
 import { buildFetchAgent } from './baileys/build-fetch-agent';
@@ -44,7 +45,6 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
   private readonly lidResolvedPhones = new Set<string>(); // avoids re-querying onWhatsApp per phone
   private readonly log = new Logger(SessionsService.name);
   private readonly encKey: Buffer;
-  private readonly dryRun: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -53,10 +53,17 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     private readonly proxy: ProxyService,
     private readonly contactsService: ContactsService,
     private readonly media: MediaService,
+    private readonly settings: SettingsService,
     config: ConfigService,
   ) {
     this.encKey = deriveKey(config.getOrThrow<string>('SESSION_ENCRYPTION_KEY'));
-    this.dryRun = config.get<string>('DRY_RUN') === 'true';
+  }
+
+  // Read live on every check (DB-backed, env fallback) rather than cached once at
+  // construction — an operator flipping the DRY_RUN toggle in the Settings UI mid-run
+  // must actually stop real sends immediately, not just after a process restart.
+  private get dryRun(): boolean {
+    return this.settings.getWithEnvFallback('DRY_RUN', 'true') === 'true';
   }
 
   async onModuleInit(): Promise<void> {
@@ -169,13 +176,12 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('Only BAILEYS sessions support this endpoint');
     }
 
-    if (!this.sockets.has(id) && !this.startingSocket.has(id)) {
-      this.startingSocket.add(id);
-      void this.startSocket(id)
-        .catch((err: unknown) =>
-          this.log.error(`startSocket error [${id}]: ${String(err)}`),
-        )
-        .finally(() => this.startingSocket.delete(id));
+    if (!this.sockets.has(id)) {
+      // startSocket is self-guarding (see its doc comment) — safe to call even if a
+      // restore/reconnect already has one in flight for this session; it no-ops then.
+      void this.startSocket(id).catch((err: unknown) =>
+        this.log.error(`startSocket error [${id}]: ${String(err)}`),
+      );
       // Give the socket time to establish before requesting pairing code
       await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
     }
@@ -194,7 +200,29 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     return { method: 'qr' };
   }
 
+  /**
+   * Single choke point for concurrent-start protection. Every call site (module-boot
+   * restore, manual connect(), the loggedOut auto-restart, and scheduleReconnect's
+   * backoff timer) funnels through here — guarding centrally, rather than trusting each
+   * call site to remember to guard itself, is the only way to guarantee two Baileys
+   * sockets never end up open for the same session at once (a near-certain ban trigger).
+   * The check-and-add below is synchronous (no `await` before it), so concurrent
+   * fire-and-forget calls can't interleave past it.
+   */
   private async startSocket(sessionId: string): Promise<void> {
+    if (this.sockets.has(sessionId) || this.startingSocket.has(sessionId)) {
+      this.log.debug(`[${sessionId}] startSocket skipped — already active or already starting`);
+      return;
+    }
+    this.startingSocket.add(sessionId);
+    try {
+      await this.startSocketInner(sessionId);
+    } finally {
+      this.startingSocket.delete(sessionId);
+    }
+  }
+
+  private async startSocketInner(sessionId: string): Promise<void> {
     const { state, saveCreds } = await makeDbAuthState(this.prisma, sessionId, this.encKey);
     const pinoLogger = pino({ level: 'silent' });
 
@@ -563,6 +591,18 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
     this.log.log(`[${sessionId}] read receipt from ${phone}`);
   }
 
+  /**
+   * Evicts sessionId from the socket map only if `sock` is still the entry there. A
+   * stale/duplicate socket's own close event must never delete a newer, live socket
+   * that has since overwritten the map entry — that would strand a genuinely connected
+   * session as "no active socket" for sends while leaving the map internally consistent.
+   */
+  private deleteSocketIfCurrent(sessionId: string, sock: ReturnType<typeof makeWASocket>): void {
+    if (this.sockets.get(sessionId) === sock) {
+      this.sockets.delete(sessionId);
+    }
+  }
+
   private async handleConnectionUpdate(
     sessionId: string,
     sock: ReturnType<typeof makeWASocket>,
@@ -602,7 +642,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         );
         await this.setStatus(sessionId, SessionStatus.BANNED);
         await this.proxy.releaseProxy(sessionId);
-        this.sockets.delete(sessionId);
+        this.deleteSocketIfCurrent(sessionId, sock);
         this.reconnectDelays.delete(sessionId);
         await this.pauseCampaignsForSession(sessionId);
         return;
@@ -619,7 +659,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         );
         await this.setStatus(sessionId, SessionStatus.OFFLINE);
         await this.proxy.releaseProxy(sessionId);
-        this.sockets.delete(sessionId);
+        this.deleteSocketIfCurrent(sessionId, sock);
         this.reconnectDelays.delete(sessionId);
         // A loggedOut/401 means WhatsApp has permanently invalidated these credentials —
         // resuming with them will always fail the same way. Clear them so the stored auth
@@ -645,7 +685,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
         // fights that device in a replace loop. Go OFFLINE and stop; operator must re-link.
         this.log.warn(`[${sessionId}] connection replaced (440) — another device took over. Marking OFFLINE, not reconnecting.`);
         await this.setStatus(sessionId, SessionStatus.OFFLINE);
-        this.sockets.delete(sessionId);
+        this.deleteSocketIfCurrent(sessionId, sock);
         this.reconnectDelays.delete(sessionId);
         return;
       }
@@ -653,7 +693,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       if (this.intentionalDisconnects.has(sessionId)) {
         this.intentionalDisconnects.delete(sessionId);
         await this.setStatus(sessionId, SessionStatus.OFFLINE);
-        this.sockets.delete(sessionId);
+        this.deleteSocketIfCurrent(sessionId, sock);
         return;
       }
 
@@ -661,7 +701,7 @@ export class SessionsService implements OnModuleInit, OnModuleDestroy {
       // Accumulate delay across repeated flaps so a flapping session doesn't hammer
       // WA servers at 3s intervals indefinitely.
       await this.setStatus(sessionId, SessionStatus.CONNECTING);
-      this.sockets.delete(sessionId);
+      this.deleteSocketIfCurrent(sessionId, sock);
       const currentDelay = this.reconnectDelays.get(sessionId) ?? 3_000;
       const nextDelay = Math.min(currentDelay * 2, 60_000);
       this.reconnectDelays.set(sessionId, nextDelay);

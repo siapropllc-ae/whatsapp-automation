@@ -1,10 +1,12 @@
-import { BadRequestException, Inject, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { BadRequestException, Inject, Injectable, InternalServerErrorException, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
 import { spinText } from '@wa-engine/shared';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
 import { OutboxProducer } from '../queue/outbox.producer';
+import { type OutboxJob } from '../queue/outbox-job.types';
 import { type ContactInputDto, type GenerateCampaignDto, type GenerateCampaignResult, type GenerateTemplatesDto } from './dto/generate-campaign.dto';
 import { type AnalyzeReplyDto, type ReplyAnalysis, type Sentiment, type ReplyIntent } from './dto/analyze-reply.dto';
 import { type OptimizeDto, type OptimizeResult, type VariantStat } from './dto/optimize.dto';
@@ -16,6 +18,26 @@ export interface AiProvider {
 }
 
 export const AI_PROVIDER_TOKEN = Symbol('AI_PROVIDER');
+
+/**
+ * Thrown by an AiProvider implementation instead of letting a raw SDK error (network
+ * failure, 429, 5xx, malformed response) propagate — callers need `retryable` to decide
+ * whether to surface a "try again" message vs. a hard failure, without depending on
+ * SDK-specific error classes (Anthropic.APIError vs. OpenAI.APIError).
+ */
+export class AiProviderError extends Error {
+  readonly cause?: unknown;
+
+  constructor(
+    message: string,
+    public readonly retryable: boolean,
+    options?: { cause?: unknown },
+  ) {
+    super(message);
+    this.name = 'AiProviderError';
+    this.cause = options?.cause;
+  }
+}
 
 // ─── LLM system prompts ───────────────────────────────────────────────────────
 
@@ -81,6 +103,29 @@ export class AiService {
     return { campaignId: dto.campaignId, messages };
   }
 
+  /**
+   * Single choke point for every provider.complete() call — translates a raw AiProviderError
+   * (or any other SDK-level throw) into a clean 503 instead of an unhandled 500 leaking SDK
+   * internals. `retryable` only changes the message text; NestJS has no built-in 502, and a
+   * 503 is the closest honest signal for "the upstream AI call failed" either way.
+   */
+  private async callProvider(systemPrompt: string, userPrompt: string): Promise<string> {
+    try {
+      return await this.provider.complete(systemPrompt, userPrompt);
+    } catch (err) {
+      if (err instanceof AiProviderError) {
+        this.log.error(`AI provider call failed (retryable=${err.retryable}): ${err.message}`);
+        throw new ServiceUnavailableException(
+          err.retryable
+            ? 'AI provider is temporarily unavailable — please retry shortly.'
+            : 'AI provider rejected the request.',
+        );
+      }
+      this.log.error(`AI provider call failed with unexpected error: ${String(err)}`);
+      throw new ServiceUnavailableException('AI provider is temporarily unavailable — please retry shortly.');
+    }
+  }
+
   private async callGenerateTemplates(dto: GenerateCampaignDto): Promise<string[]> {
     const userPrompt =
       `Product: ${dto.productBrief}\n` +
@@ -88,7 +133,7 @@ export class AiService {
       `Tone: ${dto.tone}\n` +
       `Generate exactly ${dto.count} unique message templates.`;
 
-    const raw = await this.provider.complete(GENERATE_SYSTEM, userPrompt);
+    const raw = await this.callProvider(GENERATE_SYSTEM, userPrompt);
     const parsed = this.parseJson<{ templates: unknown }>(raw);
 
     if (!Array.isArray(parsed.templates)) {
@@ -147,6 +192,30 @@ export class AiService {
     const sessionDelays = new Map<string, number>();
     for (const s of sessions) sessionDelays.set(s.id, 0);
 
+    // Remaining daily-cap headroom per session, tracked so round-robin assignment below
+    // honors it — see campaigns.service.ts's identical fix (Gap 4) for the full rationale:
+    // plain `i % sessions.length` cycling can dump most of a large batch on one
+    // near-capacity session. Falls back to unrestricted round-robin once every tracked
+    // session is exhausted; the worker's per-message daily-cap gate remains authoritative.
+    const headroom = new Map(
+      sessions.map((s) => [s.id, Math.max(0, this.warmup.getEffectiveDailyLimit(s) - s.dailySent)]),
+    );
+    let sessionCursor = 0;
+    const pickSession = (): (typeof sessions)[number] => {
+      for (let attempt = 0; attempt < sessions.length; attempt++) {
+        const candidate = sessions[sessionCursor % sessions.length]!;
+        sessionCursor++;
+        const remaining = headroom.get(candidate.id) ?? 0;
+        if (remaining > 0) {
+          headroom.set(candidate.id, remaining - 1);
+          return candidate;
+        }
+      }
+      const fallback = sessions[sessionCursor % sessions.length]!;
+      sessionCursor++;
+      return fallback;
+    };
+
     // Dedup: skip contacts that are still QUEUED for this campaign (not yet sent).
     // Only exclude QUEUED — contacts with SENT/DELIVERED/READ/REPLIED can still receive
     // follow-up messages if the operator re-runs the AI campaign.
@@ -163,19 +232,35 @@ export class AiService {
       ).map((m) => m.contactId),
     );
 
-    // Bulk stranger check — mirrors campaigns.service.ts: first-time contacts get 2.5× delay
-    const previouslySentToIds = new Set(
+    // Bulk-check how many times each contact has been messaged before — mirrors
+    // campaigns.service.ts: grouped (not a boolean presence check) so this estimate uses
+    // the exact same tiered multiplier the worker's real-time gate enforces (DelayService
+    // .contactMultiplier), rather than drifting from it.
+    const prevSentCounts = new Map(
       (
-        await this.prisma.campaignMessage.findMany({
+        await this.prisma.campaignMessage.groupBy({
+          by: ['contactId'],
           where: {
             contactId: { in: messages.map((m) => m.contactId) },
             status: { in: [MsgStatus.SENT, MsgStatus.DELIVERED, MsgStatus.READ, MsgStatus.REPLIED] },
           },
-          select: { contactId: true },
-          distinct: ['contactId'],
+          _count: { _all: true },
         })
-      ).map((m) => m.contactId),
+      ).map((row) => [row.contactId, row._count._all] as const),
     );
+
+    // Build all message rows + jobs in memory, then flush in two bulk round-trips — the
+    // same fix commit 8b496bc applied to campaigns.service.ts for the identical HTTP 504
+    // (per-contact create()+enqueue() in a loop is 2 network round-trips × N contacts).
+    const messageRows: {
+      id: string;
+      campaignId: string;
+      contactId: string;
+      sessionId: string;
+      renderedText: string;
+      status: MsgStatus;
+    }[] = [];
+    const jobs: { data: OutboxJob; delay: number }[] = [];
 
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
@@ -187,29 +272,28 @@ export class AiService {
         continue;
       }
 
-      const session = sessions[i % sessions.length];
-      if (!session) continue;
+      const session = pickSession();
 
-      const record = await this.prisma.campaignMessage.create({
-        data: {
-          campaignId,
-          contactId: msg.contactId,
-          sessionId: session.id,
-          renderedText: msg.renderedText,
-          status: MsgStatus.QUEUED,
-        },
+      const msgId = randomUUID();
+      messageRows.push({
+        id: msgId,
+        campaignId,
+        contactId: msg.contactId,
+        sessionId: session.id,
+        renderedText: msg.renderedText,
+        status: MsgStatus.QUEUED,
       });
       alreadyQueued.add(msg.contactId); // prevent duplicate if contacts array contains same contactId twice
 
       const prevDelay = sessionDelays.get(session.id) ?? 0;
-      const contactMultiplier = previouslySentToIds.has(msg.contactId) ? 1.0 : 2.5;
+      const contactMultiplier = this.delay.contactMultiplier(prevSentCounts.get(msg.contactId) ?? 0);
       const nextGap = Math.round(this.delay.computeDelayMs() * contactMultiplier);
       const totalDelay = prevDelay + nextGap;
       sessionDelays.set(session.id, totalDelay);
 
-      await this.producer.enqueue(
-        {
-          campaignMessageId: record.id,
+      jobs.push({
+        data: {
+          campaignMessageId: msgId,
           campaignId,
           contactId: msg.contactId,
           sessionId: session.id,
@@ -224,12 +308,34 @@ export class AiService {
           mediaMimeType: campaign.mediaMimeType ?? undefined,
           mediaFilename: campaign.mediaFilename ?? undefined,
         },
-        { delay: totalDelay },
+        delay: totalDelay,
+      });
+    }
+
+    if (!messageRows.length) {
+      this.log.log(`generateCampaign: all contacts already scheduled for campaign ${campaignId}, nothing to enqueue`);
+      return;
+    }
+
+    await this.prisma.campaignMessage.createMany({ data: messageRows });
+    const { failedCampaignMessageIds } = await this.producer.enqueueBulk(jobs);
+
+    if (failedCampaignMessageIds.length) {
+      // Same reconciliation as campaigns.service.ts's launch() — without this, a Redis
+      // blip mid-enqueue leaves these rows QUEUED with no backing job, stuck forever.
+      await this.prisma.campaignMessage.updateMany({
+        where: { id: { in: failedCampaignMessageIds } },
+        data: { status: MsgStatus.FAILED },
+      });
+      this.log.error(
+        `generateCampaign: ${failedCampaignMessageIds.length} message(s) failed to enqueue for campaign ${campaignId} — marked FAILED so a re-run will retry them.`,
       );
     }
 
+    const enqueuedCount = messageRows.length - failedCampaignMessageIds.length;
     this.log.log(
-      `generateCampaign: enqueued ${messages.length} messages across ${sessions.length} sessions for campaign ${campaignId}`,
+      `generateCampaign: enqueued ${enqueuedCount} message(s) across ${sessions.length} sessions for campaign ${campaignId}` +
+        (failedCampaignMessageIds.length ? ` (${failedCampaignMessageIds.length} failed to enqueue)` : ''),
     );
   }
 
@@ -242,7 +348,7 @@ export class AiService {
       `Tone: ${dto.tone}\n` +
       `Generate exactly ${dto.count} unique message templates.`;
 
-    const raw = await this.provider.complete(GENERATE_SYSTEM, userPrompt);
+    const raw = await this.callProvider(GENERATE_SYSTEM, userPrompt);
     const parsed = this.parseJson<{ templates: unknown }>(raw);
 
     if (!Array.isArray(parsed.templates)) {
@@ -254,7 +360,7 @@ export class AiService {
   // ── analyze-reply ─────────────────────────────────────────────────────────
 
   async analyzeReply(dto: AnalyzeReplyDto): Promise<ReplyAnalysis> {
-    const raw = await this.provider.complete(ANALYZE_SYSTEM, dto.text);
+    const raw = await this.callProvider(ANALYZE_SYSTEM, dto.text);
     const parsed = this.parseJson<{ sentiment: unknown; intent: unknown; score: unknown; action: unknown }>(raw);
 
     const analysis = this.validateAnalysis(parsed);

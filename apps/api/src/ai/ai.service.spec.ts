@@ -1,7 +1,7 @@
 import { Test, type TestingModule } from '@nestjs/testing';
-import { InternalServerErrorException } from '@nestjs/common';
+import { InternalServerErrorException, ServiceUnavailableException } from '@nestjs/common';
 import { MsgStatus, SessionMode, SessionStatus } from '@prisma/client';
-import { AiService, AI_PROVIDER_TOKEN, type AiProvider } from './ai.service';
+import { AiService, AI_PROVIDER_TOKEN, AiProviderError, type AiProvider } from './ai.service';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { OutboxProducer } from '../queue/outbox.producer';
 import { DelayService } from '../antiban/delay.service';
@@ -45,7 +45,7 @@ describe('AiService', () => {
   let prisma: jest.Mocked<{
     campaign: { findUnique: jest.Mock };
     session: { findMany: jest.Mock };
-    campaignMessage: { findMany: jest.Mock; create: jest.Mock };
+    campaignMessage: { findMany: jest.Mock; createMany: jest.Mock; updateMany: jest.Mock; groupBy: jest.Mock };
     reply: { findFirst: jest.Mock; update: jest.Mock; create: jest.Mock };
   }>;
   let producer: jest.Mocked<OutboxProducer>;
@@ -56,11 +56,21 @@ describe('AiService', () => {
     prisma = {
       campaign: { findUnique: jest.fn() },
       session: { findMany: jest.fn().mockResolvedValue([]) },
-      campaignMessage: { findMany: jest.fn().mockResolvedValue([]), create: jest.fn() },
+      campaignMessage: {
+        findMany: jest.fn().mockResolvedValue([]),
+        createMany: jest.fn().mockResolvedValue({ count: 0 }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        // Default: no contact has any prior sent message — all treated as strangers
+        // (prevSentCounts.get() falls through to `?? 0`), mirroring campaigns.service.spec.ts.
+        groupBy: jest.fn().mockResolvedValue([]),
+      },
       reply: { findFirst: jest.fn().mockResolvedValue(null), update: jest.fn(), create: jest.fn() },
     };
 
-    producer = { enqueue: jest.fn() } as unknown as jest.Mocked<OutboxProducer>;
+    producer = {
+      enqueue: jest.fn(),
+      enqueueBulk: jest.fn().mockResolvedValue({ failedCampaignMessageIds: [] }),
+    } as unknown as jest.Mocked<OutboxProducer>;
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -68,7 +78,15 @@ describe('AiService', () => {
         { provide: AI_PROVIDER_TOKEN, useValue: provider },
         { provide: PrismaService, useValue: prisma },
         { provide: OutboxProducer, useValue: producer },
-        { provide: DelayService, useValue: { computeDelayMs: jest.fn().mockReturnValue(75000), floorMs: 45000, typingMs: 2500 } },
+        {
+          provide: DelayService,
+          useValue: {
+            computeDelayMs: jest.fn().mockReturnValue(75000),
+            floorMs: 45000,
+            typingMs: 2500,
+            contactMultiplier: jest.fn((prevSentCount: number) => (prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0)),
+          },
+        },
         { provide: WarmupService, useValue: { getEffectiveDailyLimit: jest.fn().mockReturnValue(200) } },
       ],
     }).compile();
@@ -137,7 +155,6 @@ describe('AiService', () => {
       provider.complete.mockResolvedValue(JSON.stringify({ templates: ['Buy {name}!'] }));
       prisma.campaign.findUnique.mockResolvedValue(makeCampaign());
       prisma.session.findMany.mockResolvedValue([makeSession()]);
-      prisma.campaignMessage.create.mockResolvedValue({ id: 'msg-1' });
 
       await service.generateCampaign({
         productBrief: 'P',
@@ -148,8 +165,38 @@ describe('AiService', () => {
         campaignId: 'camp-1',
       });
 
-      expect(prisma.campaignMessage.create).toHaveBeenCalledTimes(1);
-      expect(producer.enqueue).toHaveBeenCalledTimes(1);
+      // generateCampaign now flushes via one createMany + one enqueueBulk call (the
+      // same batched pattern campaigns.service.ts uses), not per-contact create()+enqueue().
+      expect(prisma.campaignMessage.createMany).toHaveBeenCalledTimes(1);
+      expect(producer.enqueueBulk).toHaveBeenCalledTimes(1);
+      const jobs = producer.enqueueBulk.mock.calls[0]?.[0] as Array<{ data: unknown }>;
+      expect(jobs).toHaveLength(1);
+    });
+
+    it('reconciles a partial enqueueBulk failure by marking the affected message FAILED', async () => {
+      provider.complete.mockResolvedValue(JSON.stringify({ templates: ['Buy {name}!'] }));
+      prisma.campaign.findUnique.mockResolvedValue(makeCampaign());
+      prisma.session.findMany.mockResolvedValue([makeSession()]);
+
+      let enqueuedMessageId = '';
+      producer.enqueueBulk.mockImplementationOnce(async (jobs: Array<{ data: { campaignMessageId: string } }>) => {
+        enqueuedMessageId = jobs[0]!.data.campaignMessageId;
+        return { failedCampaignMessageIds: [enqueuedMessageId] };
+      });
+
+      await service.generateCampaign({
+        productBrief: 'P',
+        audience: 'A',
+        tone: 'bold',
+        count: 1,
+        contacts: [makeContact(1)],
+        campaignId: 'camp-1',
+      });
+
+      expect(prisma.campaignMessage.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [enqueuedMessageId] } },
+        data: { status: MsgStatus.FAILED },
+      });
     });
 
     it('skips enqueueing when no ONLINE session is found', async () => {
@@ -166,7 +213,7 @@ describe('AiService', () => {
         campaignId: 'camp-1',
       });
 
-      expect(producer.enqueue).not.toHaveBeenCalled();
+      expect(producer.enqueueBulk).not.toHaveBeenCalled();
     });
   });
 
@@ -240,6 +287,36 @@ describe('AiService', () => {
       await expect(
         service.analyzeReply({ contactId: 'c-1', text: 'Hi' }),
       ).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  // ── callProvider error translation (Gap 6 regression) ───────────────────────
+  // A raw AiProviderError (or any other provider-level throw) must never propagate to
+  // the controller unwrapped — it becomes a clean 503 instead of an unhandled 500 that
+  // could leak SDK-internal error shapes to the caller.
+  describe('provider failure handling', () => {
+    it('translates a retryable AiProviderError into ServiceUnavailableException', async () => {
+      provider.complete.mockRejectedValue(new AiProviderError('rate limited', true));
+
+      await expect(
+        service.analyzeReply({ contactId: 'c-1', text: 'Hi' }),
+      ).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it('translates a non-retryable AiProviderError into ServiceUnavailableException', async () => {
+      provider.complete.mockRejectedValue(new AiProviderError('invalid api key', false));
+
+      await expect(
+        service.analyzeReply({ contactId: 'c-1', text: 'Hi' }),
+      ).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it('translates an unexpected non-AiProviderError throw into ServiceUnavailableException too', async () => {
+      provider.complete.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        service.analyzeReply({ contactId: 'c-1', text: 'Hi' }),
+      ).rejects.toThrow(ServiceUnavailableException);
     });
   });
 

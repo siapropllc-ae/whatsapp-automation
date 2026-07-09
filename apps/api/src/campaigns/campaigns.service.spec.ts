@@ -78,8 +78,12 @@ const mockPrisma = {
   session: { findMany: jest.fn() },
   campaignMessage: {
     createMany: jest.fn().mockResolvedValue({ count: 0 }),
+    updateMany: jest.fn().mockResolvedValue({ count: 0 }),
     findMany: jest.fn().mockResolvedValue([]),
-    groupBy: jest.fn(),
+    // Default: no contact has any prior sent message — [] means prevSentCounts.get()
+    // falls through to `?? 0` for everyone (all strangers), matching the old findMany
+    // default this replaced (empty presence-check result).
+    groupBy: jest.fn().mockResolvedValue([]),
   },
 };
 
@@ -87,6 +91,9 @@ const mockDelay = {
   computeDelayMs: jest.fn().mockReturnValue(10_000),
   isWithinActiveHours: jest.fn().mockReturnValue(true),
   msUntilNextWindow: jest.fn().mockReturnValue(3_600_000),
+  // Real DelayService.contactMultiplier tiering, reimplemented here since DelayService
+  // itself is fully mocked in this suite — must stay in sync with delay.service.ts.
+  contactMultiplier: jest.fn((prevSentCount: number) => (prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0)),
   meanMs: 10_000,
   stdDevMs: 4_000,
   floorMs: 5_000,
@@ -102,7 +109,7 @@ const mockWarmup = {
 
 const mockProducer = {
   enqueue: jest.fn().mockResolvedValue(undefined),
-  enqueueBulk: jest.fn().mockResolvedValue(undefined),
+  enqueueBulk: jest.fn().mockResolvedValue({ failedCampaignMessageIds: [] }),
 };
 
 /** launch() now flushes jobs via one enqueueBulk() call — unwrap the batch for assertions. */
@@ -225,6 +232,50 @@ describe('CampaignsService', () => {
       expect(assignedSessions).toEqual(['s1', 's2', 's3', 's1', 's2', 's3']);
     });
 
+    // Regression test for Gap 4: plain `i % sessions.length` cycling ignored each
+    // session's remaining headroom, so a session close to its daily cap could absorb a
+    // disproportionate share of a large batch (worst case observed: ~167 messages dumped
+    // on one near-capacity session), skewing the split and creating a next-day thundering
+    // herd once the worker gate deferred the overflow all at once.
+    it('skips a near-capacity session once its headroom is exhausted, favoring sessions with more room', async () => {
+      // s1 has room for exactly 2 more sends today; s2 has ample room (200)
+      const s1 = makeSession('s1', 198);
+      const s2 = makeSession('s2', 0);
+      mockWarmup.getEffectiveDailyLimit.mockReturnValue(200); // both sessions share the same cap
+      const contacts = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6'].map(makeContact);
+
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue([s1, s2]);
+
+      await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
+
+      const assignedSessions = enqueuedJobs().map((j) => j.data['sessionId']);
+      // s1 gets its 2 headroom slots (round-robin positions 0 and 2), then every
+      // remaining contact — not just every-other — goes to s2 once s1 is exhausted.
+      expect(assignedSessions).toEqual(['s1', 's2', 's1', 's2', 's2', 's2']);
+      expect(assignedSessions.filter((id) => id === 's1')).toHaveLength(2);
+    });
+
+    it('falls back to unrestricted round-robin once every session has exhausted its tracked headroom', async () => {
+      // Both sessions have exactly 1 slot of headroom, but the batch has 4 contacts —
+      // the overflow must still be assigned (the worker's per-message gate is the real
+      // enforcement point), just via plain round-robin once headroom tracking is spent.
+      const s1 = makeSession('s1', 199);
+      const s2 = makeSession('s2', 199);
+      mockWarmup.getEffectiveDailyLimit.mockReturnValue(200);
+      const contacts = ['c1', 'c2', 'c3', 'c4'].map(makeContact);
+
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue([s1, s2]);
+
+      await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
+
+      const assignedSessions = enqueuedJobs().map((j) => j.data['sessionId']);
+      expect(assignedSessions).toEqual(['s1', 's2', 's1', 's2']);
+    });
+
     it('skips sessions that have reached the daily limit', async () => {
       // s1 is at limit per warmup cap, s2 has capacity
       // warmupDay=15 → limit=200; dailySent=200 means at limit
@@ -280,16 +331,75 @@ describe('CampaignsService', () => {
       mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
       mockPrisma.contact.findMany.mockResolvedValue(contacts);
       mockPrisma.session.findMany.mockResolvedValue(sessions);
-      // All contacts already have previous sent messages → 1.0× multiplier
-      mockPrisma.campaignMessage.findMany
-        .mockResolvedValueOnce([])  // first call = alreadyQueued (empty → proceed)
-        .mockResolvedValueOnce(contacts.map((c) => ({ contactId: c.id })));  // second = previouslySent
+      // All contacts already have 3 prior sent messages each → past the 1.8× tier, so 1.0× (no penalty)
+      mockPrisma.campaignMessage.groupBy.mockResolvedValue(
+        contacts.map((c) => ({ contactId: c.id, _count: { _all: 3 } })),
+      );
 
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
       const delays = enqueuedJobs().map((j) => j.delay);
       // No stranger penalty; cumulative: 10 000, 18 000, 30 000
       expect(delays).toEqual([10_000, 18_000, 30_000]);
+    });
+
+    it('assigns the 1.8× second-message multiplier for a contact with exactly one prior sent message', async () => {
+      mockDelay.computeDelayMs.mockReturnValueOnce(10_000);
+
+      const sessions = [makeSession('s1')];
+      const contacts = [makeContact('c1')];
+
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue(sessions);
+      mockPrisma.campaignMessage.groupBy.mockResolvedValue([{ contactId: 'c1', _count: { _all: 1 } }]);
+
+      await service.launch('camp-1', { contactIds: ['c1'] });
+
+      const delays = enqueuedJobs().map((j) => j.delay);
+      expect(delays).toEqual([18_000]); // 10 000 × 1.8
+    });
+  });
+
+  // ── enqueue reconciliation (Gap 3 regression) ──────────────────────────────
+  // Without this, a Redis blip mid-launch (enqueueBulk throwing/partially failing after
+  // createMany already persisted the rows as QUEUED) leaves those rows stuck forever —
+  // AND invisible to a retried launch() call, since its dedup check only re-queues
+  // contacts whose message status is FAILED.
+  describe('enqueue reconciliation (Gap 3)', () => {
+    it('marks messages FAILED when enqueueBulk reports they failed to reach Redis', async () => {
+      const sessions = [makeSession('s1')];
+      const contacts = ['c1', 'c2'].map(makeContact);
+
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue(sessions);
+
+      let failedId = '';
+      mockProducer.enqueueBulk.mockImplementationOnce(async (jobs: Array<{ data: { campaignMessageId: string } }>) => {
+        failedId = jobs[0]!.data.campaignMessageId; // simulate only the first job failing to enqueue
+        return { failedCampaignMessageIds: [failedId] };
+      });
+
+      await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
+
+      expect(mockPrisma.campaignMessage.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [failedId] } },
+        data: { status: 'FAILED' },
+      });
+    });
+
+    it('does not touch campaignMessage.updateMany when enqueueBulk reports no failures', async () => {
+      const sessions = [makeSession('s1')];
+      const contacts = ['c1'].map(makeContact);
+
+      mockPrisma.campaign.findUniqueOrThrow.mockResolvedValue(makeCampaign());
+      mockPrisma.contact.findMany.mockResolvedValue(contacts);
+      mockPrisma.session.findMany.mockResolvedValue(sessions);
+
+      await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
+
+      expect(mockPrisma.campaignMessage.updateMany).not.toHaveBeenCalled();
     });
   });
 

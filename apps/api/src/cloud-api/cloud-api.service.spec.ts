@@ -2,6 +2,7 @@ import { Test, type TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { CloudApiService } from './cloud-api.service';
 import { MediaService } from '../media/media.service';
+import { SettingsService } from '../settings/settings.service';
 
 function makeMedia() {
   return {
@@ -10,7 +11,7 @@ function makeMedia() {
   };
 }
 
-function makeConfig(dryRun: boolean) {
+function makeConfig() {
   return {
     getOrThrow: jest.fn().mockImplementation((key: string) => {
       if (key === 'META_ACCESS_TOKEN') return 'test-token';
@@ -18,11 +19,20 @@ function makeConfig(dryRun: boolean) {
       throw new Error(`Unexpected config key: ${key}`);
     }),
     get: jest.fn().mockImplementation((key: string) => {
-      if (key === 'DRY_RUN') return dryRun ? 'true' : 'false';
       if (key === 'META_ACCESS_TOKEN') return 'test-token';
       if (key === 'META_PHONE_NUMBER_ID') return 'test-phone-id';
       return undefined;
     }),
+  };
+}
+
+// DRY_RUN is DB-backed (SettingsService) and read live on every check — see the
+// isDryRun getter on CloudApiService. Mock it the same way the real settings module
+// resolves it (DB value with an env fallback), so a test can flip it mid-test to
+// verify the check isn't cached from construction time (Gap 13 regression).
+function makeSettings(dryRun: boolean) {
+  return {
+    getWithEnvFallback: jest.fn().mockReturnValue(dryRun ? 'true' : 'false'),
   };
 }
 
@@ -34,8 +44,9 @@ describe('CloudApiService', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           CloudApiService,
-          { provide: ConfigService, useValue: makeConfig(true) },
+          { provide: ConfigService, useValue: makeConfig() },
           { provide: MediaService, useValue: makeMedia() },
+          { provide: SettingsService, useValue: makeSettings(true) },
         ],
       }).compile();
       service = module.get<CloudApiService>(CloudApiService);
@@ -75,17 +86,40 @@ describe('CloudApiService', () => {
   describe('DRY_RUN=false', () => {
     let service: CloudApiService;
     let media: ReturnType<typeof makeMedia>;
+    let settings: ReturnType<typeof makeSettings>;
 
     beforeEach(async () => {
       media = makeMedia();
+      settings = makeSettings(false);
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           CloudApiService,
-          { provide: ConfigService, useValue: makeConfig(false) },
+          { provide: ConfigService, useValue: makeConfig() },
           { provide: MediaService, useValue: media },
+          { provide: SettingsService, useValue: settings },
         ],
       }).compile();
       service = module.get<CloudApiService>(CloudApiService);
+    });
+
+    // Regression test for Gap 13: DRY_RUN must be read live from SettingsService on
+    // every send, not cached once at construction — an operator flipping the toggle
+    // mid-run must stop the very next send, without a process restart.
+    it('stops sending real messages the moment DRY_RUN flips to true, without restarting the service', async () => {
+      const mockResponse = { ok: true, json: jest.fn().mockResolvedValue({ messages: [{ id: 'wamid.1' }] }) };
+      const fetchSpy = jest.spyOn(global, 'fetch' as never).mockResolvedValue(mockResponse as unknown as never);
+
+      const first = await service.sendTemplate({ to: '+15551234567', templateName: 'hello_world' });
+      expect(first.dryRun).toBe(false);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      settings.getWithEnvFallback.mockReturnValue('true');
+
+      const second = await service.sendTemplate({ to: '+15551234567', templateName: 'hello_world' });
+      expect(second.dryRun).toBe(true);
+      expect(fetchSpy).toHaveBeenCalledTimes(1); // unchanged — second call short-circuited
+
+      fetchSpy.mockRestore();
     });
 
     it('calls the Graph API and returns the wamid', async () => {

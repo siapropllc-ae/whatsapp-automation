@@ -268,19 +268,22 @@ export class CampaignsService {
       return;
     }
 
-    // Bulk-check which contacts have been messaged before across any campaign
-    // Used for per-contact delay multiplier: strangers get 2.5× longer gaps (anti-ban)
-    const previouslySentToIds = new Set(
+    // Bulk-check how many times each contact has been messaged before across any campaign.
+    // Grouped (not just a distinct presence check) so the launch-time delay estimate uses
+    // the exact same tiered multiplier the worker's real-time gate enforces (DelayService
+    // .contactMultiplier) — a boolean "has been sent to" can't distinguish a 2nd message
+    // (1.8×) from a 3rd+ (1.0×), which previously made this estimate drift from the gate.
+    const prevSentCounts = new Map(
       (
-        await this.prisma.campaignMessage.findMany({
+        await this.prisma.campaignMessage.groupBy({
+          by: ['contactId'],
           where: {
             contactId: { in: newContacts.map((c) => c.id) },
             status: { in: [MsgStatus.SENT, MsgStatus.DELIVERED, MsgStatus.READ, MsgStatus.REPLIED] },
           },
-          select: { contactId: true },
-          distinct: ['contactId'],
+          _count: { _all: true },
         })
-      ).map((m) => m.contactId),
+      ).map((row) => [row.contactId, row._count._all] as const),
     );
 
     // Anti-ban spin-variation guard. A template with little spin variety sends nearly the
@@ -299,6 +302,36 @@ export class CampaignsService {
     const sessionDelays = new Map<string, number>();
     for (const s of sessions) sessionDelays.set(s.id, 0);
 
+    // Remaining daily-cap headroom per session, tracked so round-robin assignment below
+    // honors it — plain `i % sessions.length` cycling can dump a large fraction of a big
+    // batch on a session that only has a handful of messages of headroom left today
+    // (e.g. one near-capacity session absorbing 150+ messages from a 500-contact launch),
+    // skewing the fair split and creating an artificial next-day thundering herd when the
+    // worker's daily-cap gate defers the overflow all at once. Once every tracked session
+    // is exhausted, assignment falls back to unrestricted round-robin — the worker's
+    // per-message gate (queue/baileys.worker.ts, queue/cloud-api.worker.ts) is still the
+    // authoritative enforcement point either way, this only improves the initial split.
+    const headroom = new Map(
+      sessions.map((s) => [s.id, Math.max(0, this.warmup.getEffectiveDailyLimit(s) - s.dailySent)]),
+    );
+    let sessionCursor = 0;
+    const pickSession = (): (typeof sessions)[number] => {
+      for (let attempt = 0; attempt < sessions.length; attempt++) {
+        const candidate = sessions[sessionCursor % sessions.length]!;
+        sessionCursor++;
+        const remaining = headroom.get(candidate.id) ?? 0;
+        if (remaining > 0) {
+          headroom.set(candidate.id, remaining - 1);
+          return candidate;
+        }
+      }
+      // Every session's tracked headroom is exhausted — fall back to plain round-robin
+      // for the overflow; the worker gate above still enforces the real cap at send time.
+      const fallback = sessions[sessionCursor % sessions.length]!;
+      sessionCursor++;
+      return fallback;
+    };
+
     // Build all message rows + jobs in memory, then flush in two bulk round-trips.
     // Awaiting a create() + enqueue() per contact in a loop was slow enough (2 network
     // round-trips × N contacts to Supabase/Redis) to blow past the Vercel proxy's 60s
@@ -315,7 +348,7 @@ export class CampaignsService {
 
     for (let i = 0; i < newContacts.length; i++) {
       const contact = newContacts[i]!;
-      const session = sessions[i % sessions.length]!;
+      const session = pickSession();
 
       const renderedText = spinText(template.body, this.buildVars(contact));
       const msgId = randomUUID();
@@ -330,8 +363,7 @@ export class CampaignsService {
       });
 
       const prevDelay = sessionDelays.get(session.id) ?? 0;
-      // Stranger penalty: first-ever outreach to a contact gets 2.5× the delay
-      const contactMultiplier = previouslySentToIds.has(contact.id) ? 1.0 : 2.5;
+      const contactMultiplier = this.delay.contactMultiplier(prevSentCounts.get(contact.id) ?? 0);
       const nextGap = Math.round(this.delay.computeDelayMs() * contactMultiplier);
       const totalDelay = prevDelay + nextGap;
       sessionDelays.set(session.id, totalDelay);
@@ -361,10 +393,27 @@ export class CampaignsService {
     }
 
     await this.prisma.campaignMessage.createMany({ data: messageRows });
-    await this.producer.enqueueBulk(jobs);
+    const { failedCampaignMessageIds } = await this.producer.enqueueBulk(jobs);
 
+    if (failedCampaignMessageIds.length) {
+      // These rows were just persisted as QUEUED but have no backing BullMQ job (a Redis
+      // blip mid-launch) — left alone they'd be stuck forever, AND silently invisible to a
+      // retried launch() call (its dedup check only re-queues contacts whose message status
+      // is FAILED). Marking them FAILED here makes a follow-up launch() actually pick them
+      // back up.
+      await this.prisma.campaignMessage.updateMany({
+        where: { id: { in: failedCampaignMessageIds } },
+        data: { status: MsgStatus.FAILED },
+      });
+      this.log.error(
+        `Campaign ${id}: ${failedCampaignMessageIds.length} message(s) failed to enqueue — marked FAILED so a re-launch will retry them.`,
+      );
+    }
+
+    const enqueuedCount = newContacts.length - failedCampaignMessageIds.length;
     this.log.log(
-      `Campaign ${id} launched: ${newContacts.length} new jobs across ${sessions.length} sessions`,
+      `Campaign ${id} launched: ${enqueuedCount} new job(s) across ${sessions.length} sessions` +
+        (failedCampaignMessageIds.length ? ` (${failedCampaignMessageIds.length} failed to enqueue)` : ''),
     );
   }
 

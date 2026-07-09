@@ -33,6 +33,17 @@ export class WebhooksController {
       this.log.warn('META_VERIFY_TOKEN not set — Cloud API webhook verification will always fail');
     }
     if (!this.appSecret) {
+      // This endpoint is @Public() with no other auth — an unset secret means anyone can
+      // POST forged delivery-status/inbound-reply/ban-signal payloads. Mirrors ApiKeyGuard's
+      // pattern: fine to boot without it in dev (Baileys-only deployments never hit this
+      // route), but a silent gap in production is unacceptable.
+      if (process.env['NODE_ENV'] === 'production') {
+        throw new Error(
+          'META_APP_SECRET must be set in production if the Cloud API webhook route is reachable — ' +
+            'without it, forged webhook payloads are accepted with no signature check. ' +
+            'Set META_APP_SECRET in .env, or remove the webhook URL from the Meta app config if unused.',
+        );
+      }
       this.log.warn('META_APP_SECRET not set — webhook HMAC validation is DISABLED');
     }
   }

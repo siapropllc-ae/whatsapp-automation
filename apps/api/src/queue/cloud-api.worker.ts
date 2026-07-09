@@ -99,7 +99,7 @@ export class CloudApiWorker extends WorkerHost {
       },
     });
     const isStranger = prevSentCount === 0;
-    const contactMultiplier = prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0;
+    const contactMultiplier = this.delay.contactMultiplier(prevSentCount);
 
     // Stranger (cold first-contact) daily sub-cap
     if (isStranger) {
@@ -197,7 +197,16 @@ export class CloudApiWorker extends WorkerHost {
       );
     } catch (err) {
       await this.recordFailure(job.data.sessionId);
-      await this.markFailed(job.data.campaignMessageId);
+      // Only mark FAILED (a terminal status) on the last configured attempt. Marking it
+      // on every attempt made the configured retry/backoff dead code: process()'s own
+      // idempotency check at the top treats FAILED as terminal, so a genuine BullMQ retry
+      // (a fresh process() call for the same job) would immediately no-op instead of
+      // actually resending — a transient error (one dropped connection, a momentary 5xx)
+      // permanently failed the message after a single try.
+      const maxAttempts = job.opts.attempts ?? 1;
+      if (job.attemptsMade >= maxAttempts) {
+        await this.markFailed(job.data.campaignMessageId);
+      }
       throw err;
     }
   }

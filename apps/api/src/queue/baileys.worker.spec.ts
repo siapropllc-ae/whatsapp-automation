@@ -49,6 +49,9 @@ const mockDelay = {
   utcHourStamp: jest.fn().mockReturnValue('2026070512'),
   computeBurstThreshold: jest.fn().mockReturnValue(1000),
   computeBurstBreakMs: jest.fn().mockReturnValue(1_800_000),
+  // Real DelayService.contactMultiplier tiering, reimplemented here since DelayService
+  // itself is fully mocked in this suite — must stay in sync with delay.service.ts.
+  contactMultiplier: jest.fn((prevSentCount: number) => (prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0)),
   floorMs: 60_000,
   meanMs: 120_000,
   typingMs: 3_000,
@@ -390,6 +393,32 @@ describe('BaileysWorker', () => {
       mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('socket closed'));
 
       await expect(worker.process(makeJob(makeJobData()))).rejects.toThrow('socket closed');
+
+      expect(mockPrisma.campaignMessage.update).toHaveBeenCalledWith({
+        where: { id: 'msg-1' },
+        data: { status: MsgStatus.FAILED },
+      });
+    });
+
+    // Regression test: marking FAILED on every attempt (not just the last) made BullMQ's
+    // configured retry dead code — process()'s own idempotency check treats FAILED as
+    // terminal, so a genuine retry attempt would immediately no-op instead of resending.
+    it('does NOT mark the message FAILED when more attempts remain — leaves it retryable', async () => {
+      mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('transient network error'));
+      const job = { ...makeJob(makeJobData()), opts: { attempts: 3 }, attemptsMade: 1 } as unknown as Job<OutboxJob>;
+
+      await expect(worker.process(job)).rejects.toThrow('transient network error');
+
+      expect(mockPrisma.campaignMessage.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: { status: MsgStatus.FAILED } }),
+      );
+    });
+
+    it('marks the message FAILED on the final configured attempt', async () => {
+      mockSessions.sendBaileyMessage.mockRejectedValueOnce(new Error('still failing'));
+      const job = { ...makeJob(makeJobData()), opts: { attempts: 3 }, attemptsMade: 3 } as unknown as Job<OutboxJob>;
+
+      await expect(worker.process(job)).rejects.toThrow('still failing');
 
       expect(mockPrisma.campaignMessage.update).toHaveBeenCalledWith({
         where: { id: 'msg-1' },

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { ButtonDef, CarouselCardDef } from '@wa-engine/shared';
 import { MediaService } from '../media/media.service';
+import { SettingsService } from '../settings/settings.service';
 
 export interface TemplateParameter {
   type: 'text' | 'currency' | 'date_time' | 'image' | 'document' | 'video' | 'payload';
@@ -69,17 +70,23 @@ export class CloudApiService {
   private readonly log = new Logger(CloudApiService.name);
   private readonly accessToken: string;
   private readonly defaultPhoneNumberId: string;
-  private readonly isDryRun: boolean;
   private readonly defaultLanguageCode: string;
 
   constructor(
     config: ConfigService,
     private readonly media: MediaService,
+    private readonly settings: SettingsService,
   ) {
     this.accessToken = config.get<string>('META_ACCESS_TOKEN') ?? '';
     this.defaultPhoneNumberId = config.get<string>('META_PHONE_NUMBER_ID') ?? '';
-    this.isDryRun = config.get<string>('DRY_RUN') === 'true';
     this.defaultLanguageCode = config.get<string>('META_DEFAULT_TEMPLATE_LANGUAGE') ?? 'en_US';
+  }
+
+  // Read live on every check (DB-backed, env fallback) rather than cached once at
+  // construction — an operator flipping the DRY_RUN toggle in the Settings UI mid-run
+  // must actually stop real sends immediately, not just after a process restart.
+  private get isDryRun(): boolean {
+    return this.settings.getWithEnvFallback('DRY_RUN', 'true') === 'true';
   }
 
   async sendTemplate(opts: SendTemplateOptions): Promise<SendTemplateResult> {

@@ -26,11 +26,19 @@ export class DelayService {
     config: ConfigService,
     private readonly settings: SettingsService,
   ) {
-    this._defaultMeanMs = +(config.get<string>('DELAY_MEAN_MS') ?? '120000');
-    this._defaultStdDevMs = +(config.get<string>('DELAY_STD_DEV_MS') ?? '35000');
-    this._defaultFloorMs = +(config.get<string>('DELAY_FLOOR_MS') ?? '60000');
-    this._defaultCeilingMs = +(config.get<string>('DELAY_CEILING_MS') ?? '480000');
-    this._defaultTypingMs = +(config.get<string>('TYPING_SIMULATION_MS') ?? '3000');
+    // A malformed .env value (e.g. DELAY_MEAN_MS=abc) must never silently become NaN —
+    // NaN propagates through computeDelayMs()'s Math.max/min clamp untouched, and
+    // `elapsed < NaN` is always false, which disables the minimum-gap anti-ban gate
+    // entirely without ever throwing. Fall back to the hardcoded default instead.
+    const parseMs = (raw: string | undefined, fallback: number): number => {
+      const n = +(raw ?? fallback);
+      return Number.isFinite(n) && n >= 0 ? n : fallback;
+    };
+    this._defaultMeanMs = parseMs(config.get<string>('DELAY_MEAN_MS'), 120_000);
+    this._defaultStdDevMs = parseMs(config.get<string>('DELAY_STD_DEV_MS'), 35_000);
+    this._defaultFloorMs = parseMs(config.get<string>('DELAY_FLOOR_MS'), 60_000);
+    this._defaultCeilingMs = parseMs(config.get<string>('DELAY_CEILING_MS'), 480_000);
+    this._defaultTypingMs = parseMs(config.get<string>('TYPING_SIMULATION_MS'), 3_000);
     this.activeHoursTimezone = config.get<string>('ACTIVE_HOURS_TIMEZONE') ?? 'UTC';
     const frac = +(config.get<string>('HOURLY_CAP_FRACTION') ?? '0.2');
     this.hourlyCapFraction = Number.isFinite(frac) && frac > 0 && frac <= 1 ? frac : 0.2;
@@ -67,6 +75,19 @@ export class DelayService {
   /** Hourly send cap for a session given its effective daily cap. */
   hourlyCap(effectiveDailyCap: number): number {
     return Math.max(1, Math.ceil(effectiveDailyCap * this.hourlyCapFraction));
+  }
+
+  /**
+   * Cold-outreach gap multiplier, tiered by how many prior messages a contact has
+   * already been sent: 2.5× for a true stranger (never sent to), 1.8× for a second
+   * message, no penalty (1.0×) from the third onward — WhatsApp throttles cold first
+   * contact hardest. This is the single source of truth for the multiplier: both the
+   * real-time worker gate (the enforced value) and campaign-launch scheduling (an
+   * estimate used only to stagger initial BullMQ job delays) must derive it from here,
+   * or the launch-time estimate silently drifts from what the worker actually enforces.
+   */
+  contactMultiplier(prevSentCount: number): number {
+    return prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0;
   }
 
   /** UTC hour bucket key suffix (YYYYMMDDHH) — used to scope the per-hour send counter in Redis. */

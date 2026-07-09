@@ -99,7 +99,7 @@ export class BaileysWorker extends WorkerHost {
       },
     });
     const isStranger = prevSentCount === 0;
-    const contactMultiplier = prevSentCount === 0 ? 2.5 : prevSentCount === 1 ? 1.8 : 1.0;
+    const contactMultiplier = this.delay.contactMultiplier(prevSentCount);
 
     // Stranger (cold first-contact) daily sub-cap
     if (isStranger) {
@@ -204,7 +204,13 @@ export class BaileysWorker extends WorkerHost {
       );
     } catch (err) {
       await this.recordFailure(job.data.sessionId);
-      await this.markFailed(job.data.campaignMessageId);
+      // Only mark FAILED (a terminal status) on the last configured attempt — see the
+      // identical comment in CloudApiWorker.process for why marking it on every attempt
+      // silently disables BullMQ's configured retry/backoff.
+      const maxAttempts = job.opts.attempts ?? 1;
+      if (job.attemptsMade >= maxAttempts) {
+        await this.markFailed(job.data.campaignMessageId);
+      }
       throw err;
     }
   }

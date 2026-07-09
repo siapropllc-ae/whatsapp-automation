@@ -8,8 +8,9 @@ import { FingerprintService } from '../antiban/fingerprint.service';
 import { ProxyService } from '../antiban/proxy.service';
 import { ContactsService } from '../contacts/contacts.service';
 import { MediaService } from '../media/media.service';
+import { SettingsService } from '../settings/settings.service';
 
-import makeWASocket from '@whiskeysockets/baileys';
+import makeWASocket, { fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 
 // Mock Baileys to prevent real WebSocket connections
 jest.mock('@whiskeysockets/baileys', () => ({
@@ -78,6 +79,12 @@ const mockProxy = {
   rotateStalledProxies: jest.fn().mockResolvedValue(undefined),
 };
 
+// DRY_RUN defaults to 'false' here so existing send-path tests exercise real socket
+// calls; individual tests override this to assert live (non-restart) toggle behavior.
+const mockSettings = {
+  getWithEnvFallback: jest.fn((key: string, fallback: string) => (key === 'DRY_RUN' ? 'false' : fallback)),
+};
+
 describe('SessionsService', () => {
   let service: SessionsService;
   let prisma: jest.Mocked<PrismaService>;
@@ -86,6 +93,13 @@ describe('SessionsService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // jest.clearAllMocks() clears call history but not implementations set via
+    // mockImplementation/mockResolvedValue — reassert the default here so a test that
+    // overrides DRY_RUN behavior can't leak into unrelated later tests.
+    mockSettings.getWithEnvFallback.mockImplementation((key: string, fallback: string) =>
+      key === 'DRY_RUN' ? 'false' : fallback,
+    );
+    (fetchLatestBaileysVersion as jest.Mock).mockResolvedValue({ version: [2, 3000, 0], isLatest: true });
 
     const mockPrisma = {
       session: {
@@ -138,6 +152,7 @@ describe('SessionsService', () => {
         { provide: ProxyService, useValue: mockProxy },
         { provide: ContactsService, useValue: mockContactsService },
         { provide: MediaService, useValue: mockMedia },
+        { provide: SettingsService, useValue: mockSettings },
         { provide: ConfigService, useValue: mockConfig },
       ],
     }).compile();
@@ -297,6 +312,65 @@ describe('SessionsService', () => {
       const makeWASocketMock = makeWASocket as jest.Mock;
       const callArgs = makeWASocketMock.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
       expect(callArgs?.fetchAgent).toBeUndefined();
+    });
+  });
+
+  // ── Concurrent-start guard (Gap 8 regression) ────────────────────────────────
+  // Regression test for: a manual "Reconnect" racing an in-flight auto-restart (module
+  // boot restore, the loggedOut auto-restart, or scheduleReconnect's backoff timer)
+  // could create two live Baileys sockets for the same session — a near-certain ban
+  // trigger. The guard now lives inside startSocket() itself (a single choke point for
+  // every call site) rather than being each call site's own responsibility.
+  describe('startSocket concurrency guard', () => {
+    it('a second concurrent call for the same session is a no-op while the first is still starting', async () => {
+      let resolveVersion!: (v: { version: [number, number, number] }) => void;
+      (fetchLatestBaileysVersion as jest.Mock).mockImplementation(
+        () => new Promise((resolve) => { resolveVersion = resolve; }),
+      );
+
+      const startSocket = (service as unknown as { startSocket: (id: string) => Promise<void> })
+        .startSocket.bind(service);
+
+      // First call: runs up to (and hangs on) fetchLatestBaileysVersion, holding the guard.
+      // The real setTimeout (not a bare microtask tick) gives the mocked makeDbAuthState +
+      // setStatus's Prisma update time to actually settle before we race the second call.
+      const first = startSocket('sess-1');
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      // Second call races the first for the same session — must see the guard and no-op.
+      const second = startSocket('sess-1');
+
+      resolveVersion({ version: [2, 3000, 0] });
+      await Promise.all([first, second]);
+
+      expect((makeWASocket as jest.Mock)).toHaveBeenCalledTimes(1);
+    });
+
+    it('a stale socket closing does not evict a newer live socket for the same session', async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      const staleSock = makeWASocketMock.mock.results[0]!.value as { ev: { on: jest.Mock } };
+      const staleOnCalls = (staleSock.ev.on as jest.Mock).mock.calls as Array<[string, (u: unknown) => void]>;
+      const staleHandler = staleOnCalls.find(([event]) => event === 'connection.update')?.[1]!;
+
+      expect(service.getSocketCount()).toBe(1);
+
+      // A second, newer socket takes over the map entry for the same session (simulates
+      // deleteSession/connect() replacing the entry out from under the stale one).
+      const newerSock = { ev: { on: jest.fn() } };
+      (service as unknown as { sockets: Map<string, unknown> }).sockets.set('sess-1', newerSock);
+      expect(service.getSocketCount()).toBe(1);
+
+      // The stale socket's own close event fires late (e.g. a delayed 440 from the
+      // connection the newer socket already replaced) — it must not delete the newer entry.
+      staleHandler({ connection: 'close', lastDisconnect: { error: { output: { statusCode: 440 } } } });
+      await new Promise<void>((r) => setTimeout(r, 10));
+
+      expect((service as unknown as { sockets: Map<string, unknown> }).sockets.get('sess-1')).toBe(newerSock);
     });
   });
 
@@ -562,9 +636,47 @@ describe('SessionsService', () => {
     });
 
     it('does nothing (no socket calls) in DRY_RUN mode', async () => {
-      (service as unknown as { dryRun: boolean }).dryRun = true;
+      mockSettings.getWithEnvFallback.mockImplementation((key: string) =>
+        key === 'DRY_RUN' ? 'true' : 'false',
+      );
       await service.sendBaileyCarousel('sess-1', '+15551234567', 'Intro', 1, cards, 0);
       expect(sock.sendMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── DRY_RUN kill-switch is DB-backed and read live (Gap 13 regression) ──────
+  // Regression test for: flipping DRY_RUN via the Settings UI mid-run silently did
+  // nothing because CloudApiService/SessionsService cached DRY_RUN once at construction
+  // time from raw env, instead of consulting SettingsService on every check like
+  // DelayService does. A real send followed by a live DRY_RUN flip (no service restart,
+  // no new instance) must stop the very next send.
+  describe('DRY_RUN live toggle', () => {
+    beforeEach(async () => {
+      const onlineSession = { ...mockSession, status: SessionStatus.ONLINE, phoneNumber: '+15551234567' };
+      (prisma.session.findMany as jest.Mock).mockResolvedValue([onlineSession]);
+      await service.onModuleInit();
+      await new Promise<void>((r) => setTimeout(r, 10));
+    });
+
+    it('stops sending real messages the moment DRY_RUN flips to true, without restarting the service', async () => {
+      const makeWASocketMock = makeWASocket as jest.Mock;
+      const sock = makeWASocketMock.mock.results[makeWASocketMock.mock.results.length - 1]!.value as {
+        sendMessage: jest.Mock;
+      };
+
+      // DRY_RUN is 'false' (the beforeEach default) — this send must be real.
+      await service.sendBaileyMessage('sess-1', '+15551234567', 'hello', 1);
+      expect(sock.sendMessage).toHaveBeenCalledTimes(1);
+
+      // Flip DRY_RUN live, exactly as the Settings UI's PATCH handler would via
+      // SettingsService.set() — no new SessionsService instance, no process restart.
+      mockSettings.getWithEnvFallback.mockImplementation((key: string) =>
+        key === 'DRY_RUN' ? 'true' : 'false',
+      );
+
+      await service.sendBaileyMessage('sess-1', '+15551234567', 'hello again', 1);
+      // Still 1 — the second call must have short-circuited on the DRY_RUN check.
+      expect(sock.sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 

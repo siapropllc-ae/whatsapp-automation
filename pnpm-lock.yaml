@@ -147,6 +147,9 @@ importers:
       eslint:
         specifier: ^8.57.0
         version: 8.57.1
+      jest:
+        specifier: ^29.0.0 || ^30.0.0
+        version: 30.4.2(@types/node@22.19.20)(ts-node@10.9.2(@types/node@22.19.20)(typescript@5.9.3))
       prisma:
         specifier: ^5.19.1
         version: 5.22.0

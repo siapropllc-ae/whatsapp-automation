@@ -83,6 +83,8 @@ model Session {
   consecutiveFailures Int   @default(0) // circuit breaker; reset to 0 on each successful send
   createdAt   DateTime      @default(now())
   messages    CampaignMessage[]
+
+  @@index([proxyId])
 }
 
 model Contact {
@@ -157,6 +159,7 @@ model Campaign {
 
   @@index([status])
   @@index([createdAt])
+  @@index([templateId])
 }
 
 model CampaignMessage {
@@ -191,11 +194,13 @@ model Reply {
   handled     Boolean  @default(false)
   buttonId    String? // set when this reply is a recognized button tap (Cloud API webhook, Baileys native, or text-fallback match)
   buttonLabel String? // the tapped button's display label, for UI/reporting
+  waMessageId String?  @unique // Meta's inbound wamid (Cloud API only) — dedupes Meta's documented at-least-once webhook redelivery
   createdAt   DateTime @default(now())
   contact     Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
   campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([contactId])
+  @@index([campaignId])
   @@index([sentiment])
   @@index([handled])
   @@index([buttonId])
@@ -225,4 +230,7 @@ model AnalyticsEvent {
   campaignId String?
   sessionId  String?
   createdAt  DateTime @default(now())
+
+  @@index([campaignId])
+  @@index([sessionId])
 }
