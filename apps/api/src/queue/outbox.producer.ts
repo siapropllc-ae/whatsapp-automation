@@ -24,4 +24,23 @@ export class OutboxProducer {
       data.mode === SessionMode.CLOUD_API ? this.cloudApiQueue : this.baileysQueue;
     await queue.add('send', data, { ...BASE_OPTS, delay: opts.delay });
   }
+
+  /**
+   * Bulk variant of enqueue() — one round-trip to Redis instead of one per job.
+   * Campaign launches can carry hundreds of jobs; awaiting queue.add() sequentially
+   * in a loop was slow enough to blow past the Vercel proxy's 60s function timeout.
+   */
+  async enqueueBulk(jobs: { data: OutboxJob; delay?: number }[]): Promise<void> {
+    if (!jobs.length) return;
+    const cloudApiJobs = jobs.filter((j) => j.data.mode === SessionMode.CLOUD_API);
+    const baileysJobs = jobs.filter((j) => j.data.mode !== SessionMode.CLOUD_API);
+
+    const toBulkSpec = (list: typeof jobs) =>
+      list.map((j) => ({ name: 'send', data: j.data, opts: { ...BASE_OPTS, delay: j.delay } }));
+
+    await Promise.all([
+      cloudApiJobs.length ? this.cloudApiQueue.addBulk(toBulkSpec(cloudApiJobs)) : Promise.resolve(),
+      baileysJobs.length ? this.baileysQueue.addBulk(toBulkSpec(baileysJobs)) : Promise.resolve(),
+    ]);
+  }
 }

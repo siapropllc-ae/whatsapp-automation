@@ -77,7 +77,7 @@ const mockPrisma = {
   contact: { findMany: jest.fn() },
   session: { findMany: jest.fn() },
   campaignMessage: {
-    create: jest.fn(),
+    createMany: jest.fn().mockResolvedValue({ count: 0 }),
     findMany: jest.fn().mockResolvedValue([]),
     groupBy: jest.fn(),
   },
@@ -102,7 +102,20 @@ const mockWarmup = {
 
 const mockProducer = {
   enqueue: jest.fn().mockResolvedValue(undefined),
+  enqueueBulk: jest.fn().mockResolvedValue(undefined),
 };
+
+/** launch() now flushes jobs via one enqueueBulk() call — unwrap the batch for assertions. */
+function enqueuedJobs(): Array<{ data: Record<string, unknown>; delay: number }> {
+  return (mockProducer.enqueueBulk.mock.calls[0]?.[0] ?? []) as Array<{
+    data: Record<string, unknown>;
+    delay: number;
+  }>;
+}
+
+function firstJobData(): Record<string, unknown> {
+  return enqueuedJobs()[0]?.data ?? {};
+}
 
 const mockSmartLists = {
   resolveContactIds: jest.fn().mockResolvedValue([]),
@@ -130,12 +143,6 @@ describe('CampaignsService', () => {
       Promise.resolve({ ...makeCampaign(), ...data }),
     );
     mockPrisma.campaign.updateMany.mockResolvedValue({ count: 1 });
-
-    // Default message create
-    mockPrisma.campaignMessage.create.mockImplementation(
-      ({ data }: { data: Record<string, unknown> }) =>
-        Promise.resolve({ id: `msg-${String(data['contactId'])}`, ...data }),
-    );
 
     const module = await Test.createTestingModule({
       providers: [
@@ -212,8 +219,7 @@ describe('CampaignsService', () => {
       const dto = { contactIds: contacts.map((c) => c.id) };
       await service.launch('camp-1', dto);
 
-      const calls = mockProducer.enqueue.mock.calls as Array<[{ sessionId: string }, unknown]>;
-      const assignedSessions = calls.map(([job]) => job.sessionId);
+      const assignedSessions = enqueuedJobs().map((j) => j.data['sessionId']);
 
       // 6 contacts, 3 sessions → s1,s2,s3,s1,s2,s3
       expect(assignedSessions).toEqual(['s1', 's2', 's3', 's1', 's2', 's3']);
@@ -236,8 +242,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
-      const calls = mockProducer.enqueue.mock.calls as Array<[{ sessionId: string }, unknown]>;
-      const usedSessions = calls.map(([job]) => job.sessionId);
+      const usedSessions = enqueuedJobs().map((j) => j.data['sessionId']);
 
       expect(usedSessions).toEqual(['s2', 's2', 's2']);
     });
@@ -258,9 +263,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
-      const delays = (mockProducer.enqueue.mock.calls as Array<[unknown, { delay: number }]>).map(
-        ([, opts]) => opts.delay,
-      );
+      const delays = enqueuedJobs().map((j) => j.delay);
       // Each gap × 2.5 (stranger penalty); cumulative: 25 000, 45 000, 75 000
       expect(delays).toEqual([25_000, 45_000, 75_000]);
     });
@@ -284,9 +287,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
-      const delays = (mockProducer.enqueue.mock.calls as Array<[unknown, { delay: number }]>).map(
-        ([, opts]) => opts.delay,
-      );
+      const delays = enqueuedJobs().map((j) => j.delay);
       // No stranger penalty; cumulative: 10 000, 18 000, 30 000
       expect(delays).toEqual([10_000, 18_000, 30_000]);
     });
@@ -310,9 +311,8 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: ['c1'] });
 
-      const calls = mockProducer.enqueue.mock.calls as Array<[{ sessionId: string }, unknown]>;
       // Only s2 (dailySent=0 < cap=30) should be used
-      expect(calls[0]?.[0].sessionId).toBe('s2');
+      expect(enqueuedJobs()[0]?.data['sessionId']).toBe('s2');
     });
   });
 
@@ -333,7 +333,7 @@ describe('CampaignsService', () => {
         where: { id: 'camp-1' },
         data: { status: CampaignStatus.PAUSED },
       });
-      expect(mockProducer.enqueue).not.toHaveBeenCalled();
+      expect(mockProducer.enqueueBulk).not.toHaveBeenCalled();
     });
 
     it('does NOT pause when at least one session has capacity', async () => {
@@ -350,7 +350,7 @@ describe('CampaignsService', () => {
         where: { id: 'camp-1', status: { not: CampaignStatus.RUNNING } },
         data: { status: CampaignStatus.RUNNING },
       });
-      expect(mockProducer.enqueue).toHaveBeenCalledTimes(1);
+      expect(enqueuedJobs()).toHaveLength(1);
     });
   });
 
@@ -373,9 +373,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
-      const jobs = (mockProducer.enqueue.mock.calls as Array<[Record<string, unknown>, unknown]>).map(
-        ([job]) => job,
-      );
+      const jobs = enqueuedJobs().map((j) => j.data);
       for (const job of jobs) {
         expect(job['mediaUrl']).toBe('http://localhost:3001/api/media/a.jpg');
         expect(job['mediaType']).toBe(MediaType.IMAGE);
@@ -402,7 +400,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: ['c1'] });
 
-      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      const job = firstJobData();
       expect(job['mediaUrl']).toBeUndefined();
       expect(job['mediaType']).toBeUndefined();
       expect(job['mediaMimeType']).toBeUndefined();
@@ -430,7 +428,7 @@ describe('CampaignsService', () => {
       mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
 
       await expect(service.launch('camp-1', { contactIds: ['c1'] })).rejects.toBeInstanceOf(BadRequestException);
-      expect(mockProducer.enqueue).not.toHaveBeenCalled();
+      expect(mockProducer.enqueueBulk).not.toHaveBeenCalled();
     });
 
     it('passes valid buttons through to the enqueued job', async () => {
@@ -442,8 +440,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: ['c1'] });
 
-      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
-      expect(job['buttons']).toEqual(buttons);
+      expect(firstJobData()['buttons']).toEqual(buttons);
     });
 
     it('applies the lenient BAILEYS cap correctly — allows a mixed combo that would fail Cloud API', async () => {
@@ -458,9 +455,8 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: ['c1'] });
 
-      expect(mockProducer.enqueue).toHaveBeenCalledTimes(1);
-      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
-      expect(job['buttons']).toEqual(buttons);
+      expect(enqueuedJobs()).toHaveLength(1);
+      expect(firstJobData()['buttons']).toEqual(buttons);
     });
 
     it('passes buttons as undefined when the template has none', async () => {
@@ -471,8 +467,7 @@ describe('CampaignsService', () => {
 
       await service.launch('camp-1', { contactIds: ['c1'] });
 
-      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
-      expect(job['buttons']).toBeUndefined();
+      expect(firstJobData()['buttons']).toBeUndefined();
     });
   });
 
@@ -497,9 +492,9 @@ describe('CampaignsService', () => {
       await service.launch('camp-1', { contactIds: contacts.map((c) => c.id) });
 
       expect(mockCloudApi.uploadMediaAsset).toHaveBeenCalledTimes(2); // once per card, not per contact
-      expect(mockProducer.enqueue).toHaveBeenCalledTimes(3); // once per contact
 
-      const jobs = (mockProducer.enqueue.mock.calls as Array<[Record<string, unknown>, unknown]>).map(([job]) => job);
+      const jobs = enqueuedJobs().map((j) => j.data);
+      expect(jobs).toHaveLength(3); // once per contact
       for (const job of jobs) {
         expect(job['carouselCardAssetIds']).toEqual(['asset-a.jpg', 'asset-b.jpg']);
         expect(job['carouselCards']).toEqual(carouselCards);
@@ -515,7 +510,7 @@ describe('CampaignsService', () => {
       await service.launch('camp-1', { contactIds: ['c1'] });
 
       expect(mockCloudApi.uploadMediaAsset).not.toHaveBeenCalled();
-      const [job] = mockProducer.enqueue.mock.calls[0] as [Record<string, unknown>, unknown];
+      const job = firstJobData();
       expect(job['carouselCards']).toEqual(carouselCards);
       expect(job['carouselCardAssetIds']).toBeUndefined();
     });
@@ -527,7 +522,7 @@ describe('CampaignsService', () => {
       mockPrisma.session.findMany.mockResolvedValue([makeSession('s1')]);
 
       await expect(service.launch('camp-1', { contactIds: ['c1'] })).rejects.toBeInstanceOf(BadRequestException);
-      expect(mockProducer.enqueue).not.toHaveBeenCalled();
+      expect(mockProducer.enqueueBulk).not.toHaveBeenCalled();
     });
   });
 

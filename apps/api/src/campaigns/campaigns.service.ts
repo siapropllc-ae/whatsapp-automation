@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   type Campaign,
@@ -18,6 +19,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { DelayService } from '../antiban/delay.service';
 import { WarmupService } from '../antiban/warmup.service';
 import { OutboxProducer } from '../queue/outbox.producer';
+import { type OutboxJob } from '../queue/outbox-job.types';
 import { SmartListsService } from '../smart-lists/smart-lists.service';
 import { MediaService } from '../media/media.service';
 import { CloudApiService } from '../cloud-api/cloud-api.service';
@@ -297,20 +299,34 @@ export class CampaignsService {
     const sessionDelays = new Map<string, number>();
     for (const s of sessions) sessionDelays.set(s.id, 0);
 
+    // Build all message rows + jobs in memory, then flush in two bulk round-trips.
+    // Awaiting a create() + enqueue() per contact in a loop was slow enough (2 network
+    // round-trips × N contacts to Supabase/Redis) to blow past the Vercel proxy's 60s
+    // function timeout on sends over ~100 contacts, surfacing as an HTTP 504 on launch.
+    const messageRows: {
+      id: string;
+      campaignId: string;
+      contactId: string;
+      sessionId: string;
+      renderedText: string;
+      status: MsgStatus;
+    }[] = [];
+    const jobs: { data: OutboxJob; delay: number }[] = [];
+
     for (let i = 0; i < newContacts.length; i++) {
       const contact = newContacts[i]!;
       const session = sessions[i % sessions.length]!;
 
       const renderedText = spinText(template.body, this.buildVars(contact));
+      const msgId = randomUUID();
 
-      const msg = await this.prisma.campaignMessage.create({
-        data: {
-          campaignId: id,
-          contactId: contact.id,
-          sessionId: session.id,
-          renderedText,
-          status: MsgStatus.QUEUED,
-        },
+      messageRows.push({
+        id: msgId,
+        campaignId: id,
+        contactId: contact.id,
+        sessionId: session.id,
+        renderedText,
+        status: MsgStatus.QUEUED,
       });
 
       const prevDelay = sessionDelays.get(session.id) ?? 0;
@@ -320,9 +336,9 @@ export class CampaignsService {
       const totalDelay = prevDelay + nextGap;
       sessionDelays.set(session.id, totalDelay);
 
-      await this.producer.enqueue(
-        {
-          campaignMessageId: msg.id,
+      jobs.push({
+        data: {
+          campaignMessageId: msgId,
           campaignId: id,
           contactId: contact.id,
           sessionId: session.id,
@@ -340,9 +356,12 @@ export class CampaignsService {
           carouselCards,
           carouselCardAssetIds,
         },
-        { delay: totalDelay },
-      );
+        delay: totalDelay,
+      });
     }
+
+    await this.prisma.campaignMessage.createMany({ data: messageRows });
+    await this.producer.enqueueBulk(jobs);
 
     this.log.log(
       `Campaign ${id} launched: ${newContacts.length} new jobs across ${sessions.length} sessions`,
